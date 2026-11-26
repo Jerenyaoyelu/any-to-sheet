@@ -144,16 +144,66 @@ function decodeFileName(name: string): string {
   }
 }
 
-function extractJsonObject(text: string): string {
-  const trimmed = text.trim();
-  const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
-  if (fenced) return fenced[1].trim();
-  const firstBrace = trimmed.indexOf('{');
-  const lastBrace = trimmed.lastIndexOf('}');
-  if (firstBrace !== -1 && lastBrace > firstBrace) {
-    return trimmed.slice(firstBrace, lastBrace + 1);
+/** First complete JSON object/array, ignoring braces that sit inside strings. */
+function sliceFirstJsonValue(text: string, start: number): string | null {
+  const opener = text[start];
+  if (opener !== '{' && opener !== '[') return null;
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let i = start; i < text.length; i++) {
+    const ch = text[i];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (ch === '\\') escaped = true;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') {
+      inString = true;
+      continue;
+    }
+    if (ch === '{' || ch === '[') depth++;
+    else if (ch === '}' || ch === ']') {
+      depth--;
+      if (depth === 0) return text.slice(start, i + 1);
+      if (depth < 0) return null;
+    }
   }
-  return trimmed;
+  return null;
+}
+
+/**
+ * Models often append a second object or a note after a valid JSON value.
+ * Taking the first `{` through the last `}` makes JSON.parse throw
+ * "Unexpected non-whitespace character after JSON".
+ */
+function parseModelItems(raw: string): { items: ExtractionRawItem[] } {
+  let text = raw.trim();
+  const fenced = text.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
+  if (fenced?.[1]) text = fenced[1].trim();
+
+  let searchFrom = 0;
+  while (searchFrom < text.length) {
+    const relative = text.slice(searchFrom).search(/[[{]/);
+    if (relative === -1) break;
+    const start = searchFrom + relative;
+    const slice = sliceFirstJsonValue(text, start);
+    if (!slice) {
+      searchFrom = start + 1;
+      continue;
+    }
+    try {
+      const parsed = JSON.parse(slice) as { items?: unknown };
+      if (parsed && typeof parsed === 'object' && Array.isArray(parsed.items)) {
+        return { items: parsed.items as ExtractionRawItem[] };
+      }
+    } catch {
+      // This brace pair was not the payload. Keep scanning.
+    }
+    searchFrom = start + 1;
+  }
+  throw new Error('大模型返回的内容无法解析成提取结果，请重试一次');
 }
 
 function parseAndValidateSchema(raw: unknown): TableSchema | null {
@@ -371,10 +421,7 @@ async function callMultimodalLLM(
     throw new Error('大模型未返回有效内容');
   }
 
-  const parsed = JSON.parse(extractJsonObject(rawContent)) as { items?: ExtractionRawItem[] };
-  if (!Array.isArray(parsed.items)) {
-    throw new Error('大模型返回 JSON 缺少 items 数组');
-  }
+  const parsed = parseModelItems(rawContent);
 
   return {
     items: parsed.items,

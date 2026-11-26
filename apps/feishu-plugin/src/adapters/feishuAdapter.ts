@@ -83,6 +83,28 @@ function findOption(options: SelectOption[] | undefined, rawName: string): Selec
   );
 }
 
+/**
+ * Sidebar plugins keep getActiveTable() on the table that was open when the
+ * extension loaded. The table the user is actually looking at is selection.tableId.
+ */
+async function resolveCurrentTable(preferredTableId?: string): Promise<{
+  table: Awaited<ReturnType<typeof bitable.base.getActiveTable>>;
+  selection: Awaited<ReturnType<typeof bitable.base.getSelection>>;
+}> {
+  const selection = await bitable.base.getSelection();
+  const tableId = preferredTableId || selection.tableId || '';
+  if (tableId) {
+    try {
+      const table = await bitable.base.getTableById(tableId);
+      return { table, selection };
+    } catch {
+      // Fall through to the host's active table.
+    }
+  }
+  const table = await bitable.base.getActiveTable();
+  return { table, selection };
+}
+
 function toFeishuCellValue(
   field: FieldSchema,
   value: unknown,
@@ -166,15 +188,23 @@ export class FeishuHostAdapter implements HostAdapter {
     return { userId, tenantKey };
   }
 
-  async getActiveTableSchema(): Promise<TableSchema> {
-    const table = await bitable.base.getActiveTable();
+  /** Fires with the table id the user just selected, including tab switches. */
+  onActiveTableChange(callback: (tableId: string) => void): () => void {
+    return bitable.base.onSelectionChange((event) => {
+      const tableId = event.data?.tableId;
+      if (tableId) callback(tableId);
+    });
+  }
+
+  async getActiveTableSchema(preferredTableId?: string): Promise<TableSchema> {
+    const { table, selection } = await resolveCurrentTable(preferredTableId);
     const tableName = await table.getName();
-    const selection = await bitable.base.getSelection();
+    const viewId = selection.tableId === table.id ? selection.viewId : null;
 
     let fieldMetaList;
-    if (selection.viewId) {
+    if (viewId) {
       try {
-        const view = await table.getViewById(selection.viewId);
+        const view = await table.getViewById(viewId);
         fieldMetaList = await view.getFieldMetaList();
       } catch {
         fieldMetaList = await table.getFieldMetaList();
@@ -237,7 +267,7 @@ export class FeishuHostAdapter implements HostAdapter {
    * temporary download URLs using direct table.getCellAttachmentUrls (halves RPC calls).
    */
   async readAttachmentsFromField(fieldId: string): Promise<HostAttachmentItem[]> {
-    const table = await bitable.base.getActiveTable();
+    const { table } = await resolveCurrentTable();
     const attachmentField = await table.getField<IAttachmentField>(fieldId);
     const recordIds = (await table.getRecordIdList()).slice(0, 50);
 
@@ -285,10 +315,14 @@ export class FeishuHostAdapter implements HostAdapter {
     schema: TableSchema,
     rows: ValidatedRow[]
   ): Promise<{ writtenCount: number }> {
-    // Always target the exact table that was extracted against (even if user switched tabs)
-    const table = schema.tableId
-      ? await bitable.base.getTableById(schema.tableId).catch(() => bitable.base.getActiveTable())
-      : await bitable.base.getActiveTable();
+    const { table: current } = await resolveCurrentTable();
+    const currentName = await current.getName().catch(() => '当前表');
+    if (schema.tableId && current.id !== schema.tableId) {
+      throw new Error(
+        `提取结果属于「${schema.tableName}」，当前打开的是「${currentName}」。请切回「${schema.tableName}」再写入，或点「重新读取」后重新提取。`
+      );
+    }
+    const table = schema.tableId ? await bitable.base.getTableById(schema.tableId) : current;
 
     const fieldMap = new Map(schema.fields.map((f) => [f.id, f]));
     const latestOptionsMap = new Map<string, SelectOption[]>();

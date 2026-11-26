@@ -104,6 +104,13 @@ body {
   font-weight: 500;
 }
 
+.table-hint {
+  margin: 4px 0 8px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
 .field-tags {
   display: flex;
   flex-wrap: wrap;
@@ -227,6 +234,11 @@ body {
 
 .btn-block {
   width: 100%;
+}
+
+.btn-wrap {
+  white-space: normal;
+  line-height: 1.45;
 }
 
 .link-danger {

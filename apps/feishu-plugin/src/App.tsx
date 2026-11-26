@@ -32,6 +32,29 @@ const FIELD_TYPE_LABEL: Record<string, string> = {
 type InputSourceTab = 'upload' | 'attachment';
 type AlertMessage = { type: 'info' | 'success' | 'error'; text: string };
 
+/** In-memory workspace for one table. Gone when the plugin panel is closed. */
+type TableSession = {
+  rows: ValidatedRow[];
+  extractResult: ExtractResponse | null;
+  writtenDone: boolean;
+  message: AlertMessage | null;
+  files: File[];
+  userHint: string;
+  sourceTab: InputSourceTab;
+};
+
+function emptySession(): TableSession {
+  return {
+    rows: [],
+    extractResult: null,
+    writtenDone: false,
+    message: null,
+    files: [],
+    userHint: '',
+    sourceTab: 'upload',
+  };
+}
+
 function quotaHint(quota: QuotaSnapshot): string {
   const parts: string[] = [];
   if (quota.dailyRemaining <= 0 && quota.totalAvailable > 0) {
@@ -151,6 +174,63 @@ export default function App() {
   const [message, setMessage] = useState<AlertMessage | null>(null);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const schemaRef = useRef<TableSchema | null>(null);
+  const rowsRef = useRef<ValidatedRow[]>([]);
+  const extractResultRef = useRef<ExtractResponse | null>(null);
+  const writtenDoneRef = useRef(false);
+  const messageRef = useRef<AlertMessage | null>(null);
+  const filesRef = useRef<File[]>([]);
+  const userHintRef = useRef('');
+  const sourceTabRef = useRef<InputSourceTab>('upload');
+  const loadingRef = useRef(false);
+  const pendingTableId = useRef<string | null>(null);
+  const switchToken = useRef(0);
+  const applyTableRef = useRef<(tableId: string) => void>(() => {});
+  const sessionsRef = useRef(new Map<string, TableSession>());
+  schemaRef.current = schema;
+  rowsRef.current = rows;
+  extractResultRef.current = extractResult;
+  writtenDoneRef.current = writtenDone;
+  messageRef.current = message;
+  filesRef.current = files;
+  userHintRef.current = userHint;
+  sourceTabRef.current = sourceTab;
+  loadingRef.current = loading;
+
+  function snapshotSession(): TableSession {
+    return {
+      rows: rowsRef.current,
+      extractResult: extractResultRef.current,
+      writtenDone: writtenDoneRef.current,
+      message: messageRef.current,
+      files: filesRef.current,
+      userHint: userHintRef.current,
+      sourceTab: sourceTabRef.current,
+    };
+  }
+
+  function rememberCurrentTable() {
+    const tableId = schemaRef.current?.tableId;
+    if (!tableId) return;
+    sessionsRef.current.set(tableId, snapshotSession());
+  }
+
+  function applySession(session: TableSession) {
+    rowsRef.current = session.rows;
+    extractResultRef.current = session.extractResult;
+    writtenDoneRef.current = session.writtenDone;
+    messageRef.current = session.message;
+    filesRef.current = session.files;
+    userHintRef.current = session.userHint;
+    sourceTabRef.current = session.sourceTab;
+    setRows(session.rows);
+    setExtractResult(session.extractResult);
+    setWrittenDone(session.writtenDone);
+    setMessage(session.message);
+    setFiles(session.files);
+    setUserHint(session.userHint);
+    setSourceTab(session.sourceTab);
+  }
 
   function buildIdentityHeaders(idObj: UserIdentity | null): Record<string, string> {
     const headers: Record<string, string> = {};
@@ -217,6 +297,55 @@ export default function App() {
     };
   }, []);
 
+  useEffect(() => {
+    if (!adapter || isMock || !(adapter instanceof FeishuHostAdapter)) return;
+    const feishu = adapter;
+
+    async function applyActiveTable(tableId: string) {
+      if (schemaRef.current?.tableId === tableId) return;
+      const token = ++switchToken.current;
+      try {
+        const next = await feishu.getActiveTableSchema(tableId);
+        if (token !== switchToken.current) return;
+        if (schemaRef.current?.tableId === next.tableId) return;
+        rememberCurrentTable();
+        schemaRef.current = next;
+        setSchema(next);
+        setInitError(null);
+        syncDefaultAttachmentField(next);
+        applySession(sessionsRef.current.get(next.tableId) ?? emptySession());
+      } catch (err) {
+        if (token !== switchToken.current) return;
+        setMessage({
+          type: 'error',
+          text: err instanceof Error ? err.message : '切换数据表后读取表头失败',
+        });
+      }
+    }
+
+    applyTableRef.current = (tableId: string) => {
+      void applyActiveTable(tableId);
+    };
+
+    const unsubscribe = feishu.onActiveTableChange((tableId) => {
+      if (!tableId || tableId === schemaRef.current?.tableId) {
+        if (tableId && tableId === schemaRef.current?.tableId) pendingTableId.current = null;
+        return;
+      }
+      if (loadingRef.current) {
+        pendingTableId.current = tableId;
+        return;
+      }
+      void applyActiveTable(tableId);
+    });
+
+    return () => {
+      switchToken.current += 1;
+      applyTableRef.current = () => {};
+      unsubscribe();
+    };
+  }, [adapter, isMock]);
+
   const writableFields = useMemo(
     () => schema?.fields.filter((f) => !f.readonly && f.type !== 'unknown') ?? [],
     [schema]
@@ -255,20 +384,29 @@ export default function App() {
       if (isMock && nextDemoKey && adapter instanceof MockHostAdapter) {
         adapter.setDemoSchema(nextDemoKey);
         setDemoKey(nextDemoKey);
-        setUserHint('');
       }
       const nextSchema = await adapter.getActiveTableSchema();
+      if (schemaRef.current?.tableId && schemaRef.current.tableId !== nextSchema.tableId) {
+        rememberCurrentTable();
+        schemaRef.current = nextSchema;
+        setSchema(nextSchema);
+        setInitError(null);
+        syncDefaultAttachmentField(nextSchema);
+        applySession(sessionsRef.current.get(nextSchema.tableId) ?? emptySession());
+        return;
+      }
+      schemaRef.current = nextSchema;
       setSchema(nextSchema);
       setInitError(null);
-      syncDefaultAttachmentField(nextSchema);
-      setRows([]);
-      setExtractResult(null);
-      setWrittenDone(false);
-      setMessage(null);
+      setSelectedAttFieldId((prev) =>
+        nextSchema.attachmentFields?.some((field) => field.id === prev)
+          ? prev
+          : nextSchema.attachmentFields?.[0]?.id || ''
+      );
     } catch (err) {
       setMessage({
         type: 'error',
-        text: err instanceof Error ? err.message : '刷新表头失败',
+        text: err instanceof Error ? err.message : '重新读取表头失败',
       });
     }
   }
@@ -378,7 +516,11 @@ export default function App() {
 
   async function handleExtract() {
     if (!schema || activeCount === 0) return;
+    const startedTableId = schema.tableId;
     setLoading(true);
+    loadingRef.current = true;
+    messageRef.current = null;
+    writtenDoneRef.current = false;
     setMessage(null);
     setWrittenDone(false);
     setProgressText('');
@@ -444,39 +586,67 @@ export default function App() {
       }
 
       const typed = data as unknown as ExtractResponse;
-      setExtractResult(typed);
-      setRows(typed.rows);
       const skipNote =
         skippedPdfPages > 0 ? `（有 ${skippedPdfPages} 页超出单份 PDF 上限已跳过）` : '';
       const unmapped = typed.rows.some((row) => row.notes?.trim()) ? '有未入表信息，' : '';
-      setMessage({
+      const info: AlertMessage = {
         type: 'info',
         text: `已提取 ${typed.rows.length} 条记录${skipNote}（消耗 ${typed.consumedPages} 页，剩余 ${typed.quota.totalAvailable} 页），${unmapped}请核对后再写入表格。`,
-      });
+      };
+      rowsRef.current = typed.rows;
+      extractResultRef.current = typed;
+      writtenDoneRef.current = false;
+      messageRef.current = info;
+      const switchedAway =
+        (pendingTableId.current && pendingTableId.current !== startedTableId) ||
+        schemaRef.current?.tableId !== startedTableId;
+      if (switchedAway) {
+        sessionsRef.current.set(startedTableId, snapshotSession());
+        return;
+      }
+      setExtractResult(typed);
+      setRows(typed.rows);
+      setMessage(info);
     } catch (err) {
-      setMessage({
+      const alert: AlertMessage = {
         type: 'error',
         text: err instanceof Error ? err.message : '请求失败，请确认后端服务已启动（pnpm dev:server）',
-      });
+      };
+      messageRef.current = alert;
+      setMessage(alert);
     } finally {
       setLoading(false);
+      loadingRef.current = false;
       setProgressText('');
+      const nextId = pendingTableId.current;
+      if (nextId && nextId !== schemaRef.current?.tableId) {
+        pendingTableId.current = null;
+        applyTableRef.current(nextId);
+      }
     }
   }
 
   function handleCellEdit(rowId: string, fieldId: string, newValue: unknown) {
     if (!schema) return;
+    writtenDoneRef.current = false;
     setWrittenDone(false);
-    setRows((prev) =>
-      prev.map((row) =>
+    setRows((prev) => {
+      const next = prev.map((row) =>
         row.rowId === rowId ? revalidateEditedRow(schema, row, fieldId, newValue) : row
-      )
-    );
+      );
+      rowsRef.current = next;
+      return next;
+    });
   }
 
   function handleDeleteRow(rowId: string) {
+    writtenDoneRef.current = false;
     setWrittenDone(false);
-    setRows((prev) => prev.filter((r) => r.rowId !== rowId));
+    setRows((prev) => {
+      const next = prev.filter((r) => r.rowId !== rowId);
+      rowsRef.current = next;
+      return next;
+    });
   }
 
   async function handleWriteToTable() {
@@ -570,7 +740,7 @@ export default function App() {
       {/* Step 1: Target Table Schema */}
       <section className="card">
         <div className="card-header">
-          <strong>1. 目标表头（自动感知）</strong>
+          <strong>1. 当前表头</strong>
           <div className="row-actions">
             {isMock && (
               <select
@@ -583,8 +753,12 @@ export default function App() {
                 <option value="expense">示例：票据/转账台账</option>
               </select>
             )}
-            <button className="btn btn-ghost" onClick={() => handleRefreshSchema()}>
-              刷新表头
+            <button
+              className="btn btn-ghost"
+              title="列有改动时重新读取。换一张表会自动更新。"
+              onClick={() => handleRefreshSchema()}
+            >
+              重新读取
             </button>
           </div>
         </div>
@@ -593,6 +767,9 @@ export default function App() {
         ) : schema ? (
           <>
             <div className="table-title">当前数据表：{schema.tableName}</div>
+            <div className="table-hint">
+              从当前数据表自动读取。换一张表，下面的文件和提取结果会换成那张表上一次的；关掉插件再打开会清空。
+            </div>
             <div className="field-tags">
               {writableFields.map((f) => (
                 <span
@@ -730,7 +907,7 @@ export default function App() {
               </>
             ) : (
               <div className="muted">
-                当前表格暂未检测到「附件」列，添加附件列后点「刷新表头」，或切回「本地上传 / PDF」。
+                当前表格暂未检测到「附件」列，添加附件列后点「重新读取」，或切回「本地上传 / PDF」。
               </div>
             )}
           </div>
@@ -912,21 +1089,21 @@ export default function App() {
           </div>
 
           <button
-            className="btn btn-success btn-block"
+            className="btn btn-success btn-block btn-wrap"
             disabled={writing || writtenDone || rows.length === 0}
             onClick={handleWriteToTable}
           >
             {writing
-              ? '正在写入表格...'
+              ? '正在写入...'
               : writtenDone
                 ? isMock
                   ? `试写成功（${rows.length} 条，未写入飞书）`
-                  : `已写入表格（${rows.length} 条，防重复提交已锁定）`
+                  : `已写入「${schema?.tableName ?? '当前表'}」（${rows.length} 条）`
                 : issueCount > 0
-                  ? `确认并写入表格（${rows.length} 条，含 ${issueCount} 处标黄）`
+                  ? `确认写入「${schema?.tableName ?? '当前表'}」（${rows.length} 条，${issueCount} 处标黄）`
                   : noteCount > 0
-                    ? `确认并写入表格（${rows.length} 条，含未入表信息）`
-                    : `一键批量写入表格（${rows.length} 条）`}
+                    ? `确认写入「${schema?.tableName ?? '当前表'}」（${rows.length} 条，含未入表信息）`
+                    : `写入「${schema?.tableName ?? '当前表'}」（${rows.length} 条）`}
           </button>
         </section>
       )}
