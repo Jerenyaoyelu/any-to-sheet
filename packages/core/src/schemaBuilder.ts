@@ -6,6 +6,23 @@ export interface ExtractionPromptPayload {
   writableFields: FieldSchema[];
 }
 
+function truncateSampleRows(
+  rows: Array<Record<string, unknown>>,
+  maxCellChars = 120
+): Array<Record<string, unknown>> {
+  return rows.slice(0, 3).map((row) => {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(row)) {
+      if (typeof v === 'string' && v.length > maxCellChars) {
+        out[k] = `${v.slice(0, maxCellChars)}...`;
+      } else {
+        out[k] = v;
+      }
+    }
+    return out;
+  });
+}
+
 /**
  * Dynamically builds a host-agnostic extraction prompt from the user's live table schema.
  * No pre-configuration or fixed templates required.
@@ -46,9 +63,10 @@ export function buildExtractionPrompt(
     '{"items":[{"sourceFileName":"文件名","values":{"字段名":值},"confidence":{"字段名":0.95},"notes":"可选补充说明"}]}',
   ].join('\n');
 
+  const compactSamples = truncateSampleRows(schema.sampleRows || []);
   const sampleText =
-    schema.sampleRows.length > 0
-      ? `\n\n【当前表格已有示例行（参考填写风格）】\n${JSON.stringify(schema.sampleRows.slice(0, 3), null, 2)}`
+    compactSamples.length > 0
+      ? `\n\n【当前表格已有示例行（参考填写风格）】\n${JSON.stringify(compactSamples, null, 2)}`
       : '';
 
   const hintText = userHint?.trim() ? `\n\n【用户额外说明】\n${userHint.trim()}` : '';

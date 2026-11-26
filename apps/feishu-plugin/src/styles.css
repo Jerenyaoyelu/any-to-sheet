@@ -27,10 +27,10 @@ body {
 .container {
   max-width: 960px;
   margin: 0 auto;
-  padding: 14px;
+  padding: 12px;
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: 10px;
 }
 
 .header {
@@ -38,6 +38,10 @@ body {
   justify-content: space-between;
   align-items: flex-start;
   gap: 8px;
+}
+
+.header-text {
+  min-width: 0;
 }
 
 .header h1 {
@@ -49,6 +53,7 @@ body {
   margin: 4px 0 0;
   color: var(--muted);
   font-size: 12px;
+  line-height: 1.4;
 }
 
 .badge {
@@ -57,6 +62,7 @@ body {
   font-size: 11px;
   font-weight: 600;
   white-space: nowrap;
+  flex-shrink: 0;
 }
 
 .badge-live {
@@ -84,12 +90,14 @@ body {
   justify-content: space-between;
   align-items: center;
   gap: 8px;
+  flex-wrap: wrap;
 }
 
 .row-actions {
   display: flex;
   gap: 6px;
   align-items: center;
+  flex-wrap: wrap;
 }
 
 .table-title {
@@ -121,7 +129,7 @@ body {
 .dropzone {
   border: 1.5px dashed #c9cdd4;
   border-radius: 8px;
-  padding: 18px 12px;
+  padding: 16px 12px;
   text-align: center;
   cursor: pointer;
   background: #fafbfc;
@@ -152,9 +160,17 @@ body {
   display: flex;
   justify-content: space-between;
   align-items: center;
+  gap: 8px;
   background: #f7f8fa;
   padding: 6px 10px;
   border-radius: 6px;
+}
+
+.file-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .hint-input,
@@ -164,9 +180,11 @@ body {
   padding: 7px 10px;
   font-size: 12px;
   outline: none;
+  background: #ffffff;
 }
 
-.hint-input:focus {
+.hint-input:focus,
+.select:focus {
   border-color: var(--primary);
 }
 
@@ -177,6 +195,8 @@ body {
   font-size: 13px;
   font-weight: 500;
   cursor: pointer;
+  white-space: nowrap;
+  flex-shrink: 0;
 }
 
 .btn:disabled {
@@ -215,12 +235,16 @@ body {
   color: var(--danger);
   cursor: pointer;
   font-size: 12px;
+  white-space: nowrap;
+  flex-shrink: 0;
 }
 
 .alert {
-  padding: 10px 12px;
+  padding: 9px 11px;
   border-radius: 8px;
   font-size: 12px;
+  line-height: 1.45;
+  word-break: break-word;
 }
 
 .alert-info {
@@ -236,6 +260,23 @@ body {
 .alert-error {
   background: #ffece8;
   color: #cb2634;
+}
+
+.warnings-summary {
+  background: #fffbe6;
+  border: 1px solid #ffe58f;
+  border-radius: 8px;
+  padding: 8px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.warning-item {
+  color: #9a6700;
+  font-size: 12px;
+  line-height: 1.45;
+  word-break: break-word;
 }
 
 .preview-table-wrap {
@@ -256,7 +297,13 @@ body {
   border-right: 1px solid var(--border);
   padding: 6px;
   text-align: left;
-  min-width: 96px;
+  min-width: 108px;
+}
+
+.preview-table th:first-child,
+.preview-table td:first-child {
+  min-width: 34px;
+  text-align: center;
 }
 
 .preview-table th {
@@ -265,12 +312,20 @@ body {
   white-space: nowrap;
 }
 
+.row-num {
+  color: var(--muted);
+}
+
 .source-cell {
-  max-width: 120px;
+  max-width: 130px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
   color: var(--muted);
+}
+
+.cell-center {
+  text-align: center !important;
 }
 
 .cell-warning {
@@ -287,13 +342,6 @@ body {
   outline: none;
 }
 
-.row-warning-banner td {
-  background: #fffbe6;
-  color: #9a6700;
-  font-size: 11px;
-  padding: 5px 8px;
-}
-
 .muted {
   color: var(--muted);
   font-size: 12px;
@@ -305,6 +353,7 @@ body {
   padding: 2px;
   border-radius: 7px;
   gap: 2px;
+  flex-shrink: 0;
 }
 
 .tab {
@@ -315,6 +364,7 @@ body {
   border-radius: 5px;
   cursor: pointer;
   color: var(--muted);
+  white-space: nowrap;
 }
 
 .tab-active {
@@ -333,6 +383,7 @@ body {
   padding: 1px 5px;
   border-radius: 4px;
   margin-right: 6px;
+  white-space: nowrap;
 }
 
 .att-panel {
@@ -352,12 +403,15 @@ body {
   align-items: center;
   gap: 8px;
   cursor: pointer;
+  min-width: 0;
+  flex: 1;
 }
 
 .options-row {
   display: flex;
   gap: 8px;
   align-items: center;
+  flex-wrap: wrap;
 }
 
 .pdf-limit {
@@ -384,7 +438,7 @@ body {
 .quota-info {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
   flex-wrap: wrap;
 }
 
@@ -393,6 +447,7 @@ body {
   border-radius: 4px;
   font-size: 11px;
   font-weight: 600;
+  white-space: nowrap;
 }
 
 .tier-free {
@@ -408,4 +463,19 @@ body {
 .redeem-card {
   border-color: #bcd4ff;
   background: #f7faff;
+}
+
+@media (max-width: 480px) {
+  .options-row {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .pdf-limit {
+    justify-content: space-between;
+  }
+
+  .att-toolbar {
+    flex-wrap: wrap;
+  }
 }

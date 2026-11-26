@@ -1,12 +1,13 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import type {
-  ExtractResponse,
-  HostAdapter,
-  HostAttachmentItem,
-  QuotaSnapshot,
-  TableSchema,
-  UserIdentity,
-  ValidatedRow,
+import {
+  revalidateEditedRow,
+  type ExtractResponse,
+  type HostAdapter,
+  type HostAttachmentItem,
+  type QuotaSnapshot,
+  type TableSchema,
+  type UserIdentity,
+  type ValidatedRow,
 } from '@table-ai/core';
 import { FeishuHostAdapter, isInsideFeishuBitable } from './adapters/feishuAdapter';
 import { DEMO_SCHEMAS, MockHostAdapter } from './adapters/mockAdapter';
@@ -29,6 +30,16 @@ const FIELD_TYPE_LABEL: Record<string, string> = {
 };
 
 type InputSourceTab = 'upload' | 'attachment';
+type AlertMessage = { type: 'info' | 'success' | 'error'; text: string };
+
+async function safeParseJson(res: Response): Promise<Record<string, unknown>> {
+  const text = await res.text();
+  try {
+    return JSON.parse(text) as Record<string, unknown>;
+  } catch {
+    return { error: `服务端返回异常 (${res.status})：${text.slice(0, 120)}` };
+  }
+}
 
 export default function App() {
   const [adapter, setAdapter] = useState<HostAdapter | null>(null);
@@ -41,8 +52,10 @@ export default function App() {
   const [showRedeem, setShowRedeem] = useState(false);
   const [redeemInput, setRedeemInput] = useState('');
   const [redeeming, setRedeeming] = useState(false);
+  const [redeemFeedback, setRedeemFeedback] = useState<AlertMessage | null>(null);
 
   const [schema, setSchema] = useState<TableSchema | null>(null);
+  const [initError, setInitError] = useState<string | null>(null);
   const [sourceTab, setSourceTab] = useState<InputSourceTab>('upload');
 
   // Local upload state
@@ -60,9 +73,10 @@ export default function App() {
   const [loading, setLoading] = useState(false);
   const [progressText, setProgressText] = useState('');
   const [writing, setWriting] = useState(false);
+  const [writtenDone, setWrittenDone] = useState(false);
   const [extractResult, setExtractResult] = useState<ExtractResponse | null>(null);
   const [rows, setRows] = useState<ValidatedRow[]>([]);
-  const [message, setMessage] = useState<{ type: 'info' | 'success' | 'error'; text: string } | null>(null);
+  const [message, setMessage] = useState<AlertMessage | null>(null);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -79,10 +93,12 @@ export default function App() {
         headers: buildIdentityHeaders(idObj),
       });
       if (!res.ok) return;
-      const data = (await res.json()) as { mode: 'llm' | 'mock'; quota: QuotaSnapshot };
-      setServerMode(data.mode);
-      setQuota(data.quota);
-      setMaxPdfPages((prev) => Math.min(prev, data.quota.maxPdfPages));
+      const data = (await safeParseJson(res)) as { mode?: 'llm' | 'mock'; quota?: QuotaSnapshot };
+      if (data.mode) setServerMode(data.mode);
+      if (data.quota) {
+        setQuota(data.quota);
+        setMaxPdfPages((prev) => Math.min(prev, data.quota!.maxPdfPages));
+      }
     } catch {
       // Backend might be offline; handled on extract
     }
@@ -96,24 +112,37 @@ export default function App() {
   }
 
   useEffect(() => {
+    let cancelled = false;
     (async () => {
-      const inFeishu = await isInsideFeishuBitable();
-      const activeAdapter: HostAdapter = inFeishu ? new FeishuHostAdapter() : new MockHostAdapter();
-      setAdapter(activeAdapter);
-      setIsMock(!inFeishu);
+      try {
+        const inFeishu = await isInsideFeishuBitable();
+        const activeAdapter: HostAdapter = inFeishu ? new FeishuHostAdapter() : new MockHostAdapter();
+        if (cancelled) return;
+        setAdapter(activeAdapter);
+        setIsMock(!inFeishu);
 
-      const [nextSchema, nextId] = await Promise.all([
-        activeAdapter.getActiveTableSchema(),
-        activeAdapter.getUserIdentity
-          ? activeAdapter.getUserIdentity()
-          : Promise.resolve({ userId: 'anonymous' }),
-      ]);
+        const [nextSchema, nextId] = await Promise.all([
+          activeAdapter.getActiveTableSchema(),
+          activeAdapter.getUserIdentity
+            ? activeAdapter.getUserIdentity()
+            : Promise.resolve({ userId: 'anonymous' }),
+        ]);
 
-      setSchema(nextSchema);
-      setIdentity(nextId);
-      syncDefaultAttachmentField(nextSchema);
-      await fetchQuota(nextId);
+        if (cancelled) return;
+        setSchema(nextSchema);
+        setIdentity(nextId);
+        setInitError(null);
+        syncDefaultAttachmentField(nextSchema);
+        await fetchQuota(nextId);
+      } catch (err) {
+        if (!cancelled) {
+          setInitError(err instanceof Error ? err.message : '初始化读取表格结构失败，请点击重试');
+        }
+      }
     })();
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   const writableFields = useMemo(
@@ -131,25 +160,54 @@ export default function App() {
     return count;
   }, [rows]);
 
+  const allRowWarnings = useMemo(() => {
+    const list: Array<{ rowNum: number; text: string }> = [];
+    rows.forEach((r, idx) => {
+      r.rowWarnings.forEach((w) => {
+        list.push({ rowNum: idx + 1, text: w });
+      });
+    });
+    return list;
+  }, [rows]);
+
   const maxFilesAllowed = quota?.maxFilesPerRequest ?? 3;
   const maxPdfAllowed = quota?.maxPdfPages ?? 3;
   const activeCount = sourceTab === 'upload' ? files.length : selectedAttIds.length;
 
   async function handleRefreshSchema(nextDemoKey?: keyof typeof DEMO_SCHEMAS) {
     if (!adapter) return;
-    if (isMock && nextDemoKey && adapter instanceof MockHostAdapter) {
-      adapter.setDemoSchema(nextDemoKey);
-      setDemoKey(nextDemoKey);
+    try {
+      if (isMock && nextDemoKey && adapter instanceof MockHostAdapter) {
+        adapter.setDemoSchema(nextDemoKey);
+        setDemoKey(nextDemoKey);
+      }
+      const nextSchema = await adapter.getActiveTableSchema();
+      setSchema(nextSchema);
+      setInitError(null);
+      syncDefaultAttachmentField(nextSchema);
+      setRows([]);
+      setExtractResult(null);
+      setWrittenDone(false);
+      setMessage(null);
+    } catch (err) {
+      setMessage({
+        type: 'error',
+        text: err instanceof Error ? err.message : '刷新表头失败',
+      });
     }
-    const nextSchema = await adapter.getActiveTableSchema();
-    setSchema(nextSchema);
-    syncDefaultAttachmentField(nextSchema);
-    setRows([]);
-    setExtractResult(null);
-    setMessage(null);
   }
 
-  function handleFileChange(fileList: FileList | null) {
+  function handleFileChange(e: React.ChangeEvent<HTMLInputElement>) {
+    const fileList = e.target.files;
+    if (!fileList) return;
+    const incoming = Array.from(fileList);
+    setFiles((prev) => [...prev, ...incoming].slice(0, maxFilesAllowed));
+    setMessage(null);
+    // Reset input so removing and re-selecting the same file works cleanly
+    e.target.value = '';
+  }
+
+  function handleDropFiles(fileList: FileList | null) {
     if (!fileList) return;
     const incoming = Array.from(fileList);
     setFiles((prev) => [...prev, ...incoming].slice(0, maxFilesAllowed));
@@ -158,6 +216,13 @@ export default function App() {
 
   function handleRemoveFile(index: number) {
     setFiles((prev) => prev.filter((_, i) => i !== index));
+  }
+
+  function handleAttachmentFieldChange(nextFieldId: string) {
+    setSelectedAttFieldId(nextFieldId);
+    setAttachments([]);
+    setSelectedAttIds([]);
+    setMessage(null);
   }
 
   async function handleScanAttachmentColumn() {
@@ -185,15 +250,25 @@ export default function App() {
   }
 
   function toggleAttachment(id: string) {
-    setSelectedAttIds((prev) =>
-      prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]
-    );
+    setSelectedAttIds((prev) => {
+      if (prev.includes(id)) {
+        return prev.filter((x) => x !== id);
+      }
+      if (prev.length >= maxFilesAllowed) {
+        setMessage({
+          type: 'info',
+          text: `当前套餐单次最多选择 ${maxFilesAllowed} 份文件，请先取消其他勾选或升级 Pro。`,
+        });
+        return prev;
+      }
+      return [...prev, id];
+    });
   }
 
   async function handleRedeemCode() {
     if (!identity || !redeemInput.trim()) return;
     setRedeeming(true);
-    setMessage(null);
+    setRedeemFeedback(null);
     try {
       const res = await fetch('/api/quota/redeem', {
         method: 'POST',
@@ -203,19 +278,20 @@ export default function App() {
         },
         body: JSON.stringify({ code: redeemInput.trim() }),
       });
-      const data = await res.json();
+      const data = await safeParseJson(res);
       if (!res.ok) {
-        throw new Error(data.error || '兑换失败');
+        throw new Error(String(data.error || '兑换失败'));
       }
-      setQuota(data.quota as QuotaSnapshot);
+      if (data.quota) {
+        setQuota(data.quota as QuotaSnapshot);
+      }
       setRedeemInput('');
-      setShowRedeem(false);
-      setMessage({
+      setRedeemFeedback({
         type: 'success',
-        text: `兑换成功！已到账 ${data.addedPages} 页永久付费额度，已自动解锁 Pro 批量与高精模式。`,
+        text: `兑换成功！已到账 ${String(data.addedPages)} 页永久付费额度，已自动解锁 Pro 批量与高精模式。`,
       });
     } catch (err) {
-      setMessage({
+      setRedeemFeedback({
         type: 'error',
         text: err instanceof Error ? err.message : '激活码兑换失败',
       });
@@ -228,6 +304,7 @@ export default function App() {
     if (!schema || activeCount === 0) return;
     setLoading(true);
     setMessage(null);
+    setWrittenDone(false);
     setProgressText('');
     try {
       let rawFiles: File[] = [];
@@ -244,11 +321,25 @@ export default function App() {
       }
 
       const effectivePdfPages = Math.min(maxPdfPages, maxPdfAllowed);
-      const preparedFiles = await prepareFilesForExtraction(rawFiles, {
+      const { files: preparedFiles, skippedPdfPages } = await prepareFilesForExtraction(rawFiles, {
         maxPages: effectivePdfPages,
         scale: 2.0,
         onProgress: (txt) => setProgressText(txt),
       });
+
+      // Pre-check total expanded PDF page count BEFORE uploading so user gets a clear message
+      if (preparedFiles.length > maxFilesAllowed) {
+        setShowRedeem(true);
+        throw new Error(
+          `展开 PDF 后共 ${preparedFiles.length} 页，超过当前套餐单次上限（${maxFilesAllowed} 页/图）。请调小「PDF 上限」或分批上传，或兑换激活码升级 Pro（单次 20 页）。`
+        );
+      }
+      if (quota && preparedFiles.length > quota.totalAvailable) {
+        setShowRedeem(true);
+        throw new Error(
+          `展开后共需 ${preparedFiles.length} 页额度，当前剩余 ${quota.totalAvailable} 页。请减少上传页数或兑换激活码充值。`
+        );
+      }
 
       setProgressText(`正在调用 AI 提取 ${preparedFiles.length} 页/份文件并执行校验...`);
 
@@ -265,7 +356,7 @@ export default function App() {
         body: formData,
       });
 
-      const data = await res.json();
+      const data = await safeParseJson(res);
       if (data.quota) {
         setQuota(data.quota as QuotaSnapshot);
       }
@@ -273,15 +364,17 @@ export default function App() {
         if (res.status === 402 || res.status === 403 || res.status === 429) {
           setShowRedeem(true);
         }
-        throw new Error(data.error || '提取失败');
+        throw new Error(String(data.error || '提取失败'));
       }
 
-      const typed = data as ExtractResponse;
+      const typed = data as unknown as ExtractResponse;
       setExtractResult(typed);
       setRows(typed.rows);
+      const skipNote =
+        skippedPdfPages > 0 ? `（有 ${skippedPdfPages} 页超出单份 PDF 上限已跳过）` : '';
       setMessage({
         type: 'info',
-        text: `已提取 ${typed.rows.length} 条记录（消耗 ${typed.consumedPages} 页额度，剩余 ${typed.quota.totalAvailable} 页），请核对标黄单元格后写入表格。`,
+        text: `已提取 ${typed.rows.length} 条记录${skipNote}（消耗 ${typed.consumedPages} 页，剩余 ${typed.quota.totalAvailable} 页），请核对标黄项后写入表格。`,
       });
     } catch (err) {
       setMessage({
@@ -294,38 +387,28 @@ export default function App() {
     }
   }
 
-  function handleCellEdit(rowId: string, fieldId: string, newValue: string) {
+  function handleCellEdit(rowId: string, fieldId: string, newValue: unknown) {
+    if (!schema) return;
+    setWrittenDone(false);
     setRows((prev) =>
-      prev.map((row) => {
-        if (row.rowId !== rowId) return row;
-        const target = row.cells[fieldId];
-        if (!target) return row;
-        return {
-          ...row,
-          cells: {
-            ...row.cells,
-            [fieldId]: {
-              ...target,
-              value: newValue,
-              status: 'ok',
-              reason: '已人工确认修改',
-            },
-          },
-        };
-      })
+      prev.map((row) =>
+        row.rowId === rowId ? revalidateEditedRow(schema, row, fieldId, newValue) : row
+      )
     );
   }
 
   function handleDeleteRow(rowId: string) {
+    setWrittenDone(false);
     setRows((prev) => prev.filter((r) => r.rowId !== rowId));
   }
 
   async function handleWriteToTable() {
-    if (!adapter || !schema || rows.length === 0) return;
+    if (!adapter || !schema || rows.length === 0 || writtenDone) return;
     setWriting(true);
     setMessage(null);
     try {
       const { writtenCount } = await adapter.writeValidatedRows(schema, rows);
+      setWrittenDone(true);
       setMessage({
         type: 'success',
         text: isMock
@@ -345,12 +428,12 @@ export default function App() {
   return (
     <div className="container">
       <header className="header">
-        <div>
+        <div className="header-text">
           <h1>AnyToSheet 万物入表</h1>
-          <p className="subtitle">自动读取表头 · 扫描版 PDF 转高清图 · 附件列批量提取 · 异常标黄复核</p>
+          <p className="subtitle">自动读取表头 · 扫描版 PDF 转高清图 · 附件列批量提取 · 标黄校验复核</p>
         </div>
         <span className={`badge ${isMock ? 'badge-mock' : 'badge-live'}`}>
-          {isMock ? '本地演示模式' : '飞书已连接'}
+          {isMock ? '本地演示' : '飞书已连接'}
         </span>
       </header>
 
@@ -362,17 +445,20 @@ export default function App() {
               {quota.tier === 'pro' ? 'Pro 会员' : '免费版'}
             </span>
             <span>
-              可用额度 <strong>{quota.totalAvailable}</strong> 页
+              可用 <strong>{quota.totalAvailable}</strong> 页
             </span>
             <small className="muted">
-              （今日免费 {quota.dailyRemaining}/{quota.dailyLimit}
-              {quota.welcomeRemaining > 0 ? ` · 新人赠送 ${quota.welcomeRemaining}` : ''}
-              {quota.paidRemaining > 0 ? ` · 付费永久 ${quota.paidRemaining}` : ''}）
+              （今日 {quota.dailyRemaining}/{quota.dailyLimit}
+              {quota.welcomeRemaining > 0 ? ` · 新人 ${quota.welcomeRemaining}` : ''}
+              {quota.paidRemaining > 0 ? ` · 永久 ${quota.paidRemaining}` : ''}）
             </small>
           </div>
           <button
             className="btn btn-ghost"
-            onClick={() => setShowRedeem((prev) => !prev)}
+            onClick={() => {
+              setShowRedeem((prev) => !prev);
+              setRedeemFeedback(null);
+            }}
           >
             {showRedeem ? '收起兑换' : '兑换激活码'}
           </button>
@@ -382,21 +468,15 @@ export default function App() {
       {showRedeem && (
         <section className="card redeem-card">
           <div className="card-header">
-            <strong>兑换 Pro 额度激活码</strong>
-            <small className="muted">
-              Pro 解锁单次 20 页批量 + PDF 10 页/份 + 旗舰高精度模型
-            </small>
+            <strong>兑换 Pro 激活码</strong>
+            <small className="muted">解锁单次 20 页 + PDF 10 页/份 + 高精模型</small>
           </div>
           <div className="att-toolbar">
             <input
               className="hint-input"
-              style={{ flex: 1 }}
+              style={{ flex: 1, minWidth: 0 }}
               type="text"
-              placeholder={
-                serverMode === 'mock'
-                  ? '输入激活码（演示模式可试填 ATS-DEMO-100）'
-                  : '请输入激活码（例如 ATS-XXXX-XXXX）'
-              }
+              placeholder={serverMode === 'mock' ? '测试码：ATS-DEMO-100' : '输入激活码 ATS-XXXX-XXXX'}
               value={redeemInput}
               onChange={(e) => setRedeemInput(e.target.value)}
             />
@@ -408,6 +488,9 @@ export default function App() {
               {redeeming ? '兑换中...' : '立即兑换'}
             </button>
           </div>
+          {redeemFeedback && (
+            <div className={`alert alert-${redeemFeedback.type}`}>{redeemFeedback.text}</div>
+          )}
         </section>
       )}
 
@@ -432,7 +515,9 @@ export default function App() {
             </button>
           </div>
         </div>
-        {schema ? (
+        {initError ? (
+          <div className="alert alert-error">{initError}</div>
+        ) : schema ? (
           <>
             <div className="table-title">当前数据表：{schema.tableName}</div>
             <div className="field-tags">
@@ -457,8 +542,7 @@ export default function App() {
       <section className="card">
         <div className="card-header">
           <strong>
-            2. 选择待识别文件{' '}
-            <small className="muted">（单次上限 {maxFilesAllowed} 份）</small>
+            2. 选择待识别文件 <small className="muted">（单次上限 {maxFilesAllowed} 页/图）</small>
           </strong>
           <div className="tabs">
             <button
@@ -471,7 +555,7 @@ export default function App() {
               className={`tab ${sourceTab === 'attachment' ? 'tab-active' : ''}`}
               onClick={() => setSourceTab('attachment')}
             >
-              读取表格附件列
+              读取附件列
             </button>
           </div>
         </div>
@@ -484,7 +568,7 @@ export default function App() {
               onDragOver={(e) => e.preventDefault()}
               onDrop={(e) => {
                 e.preventDefault();
-                handleFileChange(e.dataTransfer.files);
+                handleDropFiles(e.dataTransfer.files);
               }}
             >
               <input
@@ -493,17 +577,17 @@ export default function App() {
                 multiple
                 accept="image/*,.pdf,.txt,.md,.csv,.json"
                 style={{ display: 'none' }}
-                onChange={(e) => handleFileChange(e.target.files)}
+                onChange={handleFileChange}
               />
-              <div>点击选择或拖入 图片 / 微信截图 / PDF（含扫描件）/ 文本</div>
-              <small>按实际提取页数计费（1 张图或 1 页 PDF = 1 页额度），失败不扣额度</small>
+              <div>点击选择或拖入 图片 / 微信截图 / PDF / 文本</div>
+              <small>按实际提取页数计费（1 张图或 1 页 PDF = 1 页额度），失败不扣费</small>
             </div>
 
             {files.length > 0 && (
               <ul className="file-list">
                 {files.map((f, idx) => (
                   <li key={`${f.name}-${idx}`}>
-                    <span>
+                    <span className="file-name">
                       {isPdfFile(f) && <span className="pill-pdf">PDF 转高清图</span>}
                       {f.name} <small>({(f.size / 1024).toFixed(1)} KB)</small>
                     </span>
@@ -522,9 +606,9 @@ export default function App() {
                 <div className="att-toolbar">
                   <select
                     className="select"
-                    style={{ flex: 1 }}
+                    style={{ flex: 1, minWidth: 0 }}
                     value={selectedAttFieldId}
-                    onChange={(e) => setSelectedAttFieldId(e.target.value)}
+                    onChange={(e) => handleAttachmentFieldChange(e.target.value)}
                   >
                     {schema.attachmentFields.map((af) => (
                       <option key={af.id} value={af.id}>
@@ -553,7 +637,7 @@ export default function App() {
                               checked={checked}
                               onChange={() => toggleAttachment(att.id)}
                             />
-                            <span>
+                            <span className="file-name">
                               {isPdfFile({ name: att.fileName, type: att.mimeType }) && (
                                 <span className="pill-pdf">PDF</span>
                               )}
@@ -567,13 +651,13 @@ export default function App() {
                   </ul>
                 ) : (
                   <div className="muted">
-                    点击「一键扫描附件列」，即可批量读取表格附件列里的 PDF / 图片直接提取。
+                    点击「一键扫描附件列」，批量读取表格附件列里的 PDF / 图片直接提取。
                   </div>
                 )}
               </>
             ) : (
               <div className="muted">
-                当前表格暂未检测到「附件」类型的列，请在多维表格中添加附件列后点「刷新表头」，或切回「本地上传 / PDF」。
+                当前表格暂未检测到「附件」列，添加附件列后点「刷新表头」，或切回「本地上传 / PDF」。
               </div>
             )}
           </div>
@@ -582,9 +666,9 @@ export default function App() {
         <div className="options-row">
           <input
             className="hint-input"
-            style={{ flex: 1 }}
+            style={{ flex: 1, minWidth: 0 }}
             type="text"
-            placeholder="可选说明（例如：只提取含税金额 / 跳过表尾总计行）"
+            placeholder="可选说明：如只提含税金额、跳过合计行"
             value={userHint}
             onChange={(e) => setUserHint(e.target.value)}
           />
@@ -623,15 +707,39 @@ export default function App() {
               3. 提取预览与复核（{rows.length} 条
               {warningCount > 0 ? `，${warningCount} 处标黄待复核` : '，全部校验通过'}）
             </strong>
-            {extractResult && extractResult.mode === 'llm' && (
-              <span className="muted">预估成本 ¥{extractResult.estimatedCostCny}</span>
-            )}
+            <div className="row-actions">
+              {extractResult && extractResult.mode === 'llm' && (
+                <span className="muted">约 ¥{extractResult.estimatedCostCny}</span>
+              )}
+              <button
+                className="btn btn-ghost"
+                onClick={() => {
+                  setRows([]);
+                  setExtractResult(null);
+                  setWrittenDone(false);
+                }}
+              >
+                清空
+              </button>
+            </div>
           </div>
+
+          {/* Dedicated full-width warning box outside horizontally-scrolling table */}
+          {allRowWarnings.length > 0 && (
+            <div className="warnings-summary">
+              {allRowWarnings.map((w, idx) => (
+                <div key={idx} className="warning-item">
+                  ⚠️ 第 {w.rowNum} 行：{w.text}
+                </div>
+              ))}
+            </div>
+          )}
 
           <div className="preview-table-wrap">
             <table className="preview-table">
               <thead>
                 <tr>
+                  <th>#</th>
                   <th>来源文件</th>
                   {writableFields.map((f) => (
                     <th key={f.id}>{f.name}</th>
@@ -640,49 +748,55 @@ export default function App() {
                 </tr>
               </thead>
               <tbody>
-                {rows.map((row) => (
-                  <React.Fragment key={row.rowId}>
-                    <tr>
-                      <td className="source-cell" title={row.sourceFileName}>
-                        {row.sourceFileName}
-                      </td>
-                      {writableFields.map((f) => {
-                        const cell = row.cells[f.id];
-                        const displayVal = Array.isArray(cell?.value)
-                          ? cell.value.join(', ')
-                          : cell?.value ?? '';
-                        const isWarn = cell && cell.status !== 'ok';
+                {rows.map((row, rowIndex) => (
+                  <tr key={row.rowId}>
+                    <td className="row-num">{rowIndex + 1}</td>
+                    <td className="source-cell" title={row.sourceFileName}>
+                      {row.sourceFileName}
+                    </td>
+                    {writableFields.map((f) => {
+                      const cell = row.cells[f.id];
+                      const isWarn = cell && cell.status !== 'ok';
+                      const tooltip =
+                        cell?.reason ||
+                        `置信度 ${Math.round((cell?.confidence ?? 0.9) * 100)}%`;
+
+                      if (f.type === 'checkbox') {
                         return (
                           <td
                             key={f.id}
-                            className={isWarn ? 'cell-warning' : ''}
-                            title={
-                              cell?.reason ||
-                              `置信度 ${Math.round((cell?.confidence ?? 0.9) * 100)}%`
-                            }
+                            className={`cell-center ${isWarn ? 'cell-warning' : ''}`}
+                            title={tooltip}
                           >
                             <input
-                              className="cell-input"
-                              value={String(displayVal)}
-                              onChange={(e) => handleCellEdit(row.rowId, f.id, e.target.value)}
+                              type="checkbox"
+                              checked={Boolean(cell?.value)}
+                              onChange={(e) => handleCellEdit(row.rowId, f.id, e.target.checked)}
                             />
                           </td>
                         );
-                      })}
-                      <td>
-                        <button className="link-danger" onClick={() => handleDeleteRow(row.rowId)}>
-                          删行
-                        </button>
-                      </td>
-                    </tr>
-                    {row.rowWarnings.length > 0 && (
-                      <tr className="row-warning-banner">
-                        <td colSpan={writableFields.length + 2}>
-                          ⚠️ {row.rowWarnings.join(' ｜ ')}
+                      }
+
+                      const displayVal = Array.isArray(cell?.value)
+                        ? cell.value.join(', ')
+                        : cell?.value ?? '';
+
+                      return (
+                        <td key={f.id} className={isWarn ? 'cell-warning' : ''} title={tooltip}>
+                          <input
+                            className="cell-input"
+                            value={String(displayVal)}
+                            onChange={(e) => handleCellEdit(row.rowId, f.id, e.target.value)}
+                          />
                         </td>
-                      </tr>
-                    )}
-                  </React.Fragment>
+                      );
+                    })}
+                    <td>
+                      <button className="link-danger" onClick={() => handleDeleteRow(row.rowId)}>
+                        删行
+                      </button>
+                    </td>
+                  </tr>
                 ))}
               </tbody>
             </table>
@@ -690,10 +804,16 @@ export default function App() {
 
           <button
             className="btn btn-success btn-block"
-            disabled={writing || rows.length === 0}
+            disabled={writing || writtenDone || rows.length === 0}
             onClick={handleWriteToTable}
           >
-            {writing ? '正在写入表格...' : `一键批量写入表格（${rows.length} 条）`}
+            {writing
+              ? '正在写入表格...'
+              : writtenDone
+                ? `已写入表格（${rows.length} 条，防重复提交已锁定）`
+                : warningCount > 0
+                  ? `确认并写入表格（${rows.length} 条，含 ${warningCount} 处标黄）`
+                  : `一键批量写入表格（${rows.length} 条）`}
           </button>
         </section>
       )}
