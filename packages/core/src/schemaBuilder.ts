@@ -52,15 +52,16 @@ export function buildExtractionPrompt(
     '1. 仅输出合法的 JSON，不要包含 Markdown 代码块或任何额外解释文字。',
     '2. 如果单个文件里包含多条明细记录（例如一张报价单有多行商品、一张截图有多条账目），请拆分为多条记录输出；如果是单主体文件（如简历、发票、名片），输出 1 条记录。',
     '3. 字段值规范：',
-    '   - number: 输出纯数字（去掉货币符号和逗号，如 1250.5）。',
+    '   - number: 输出纯数字（去掉货币符号和逗号）。金额、单价、合计保留原件小数位，不要收成整数。',
     '   - date: 尽量统一输出 YYYY-MM-DD 格式。',
-    '   - singleSelect: 优先精确匹配 allowedOptions 中的选项名称；如果没有完全匹配，给出最合理的短文本。',
-    '   - multiSelect: 输出字符串数组，优先匹配 allowedOptions。',
+    '   - singleSelect: 必须从 allowedOptions 中选一个最匹配的名称；对不上就填最接近的选项，不要把括号里的额外信息塞进选项。',
+    '   - multiSelect: 输出字符串数组，每项必须来自 allowedOptions。',
     '   - checkbox: 输出 true 或 false。',
     '   - 找不到的字段填 null，绝对不要编造！',
     '4. 为每个提取字段评估置信度 confidence（0 到 1 之间的小数，清晰明确为 0.95，模糊或推测低于 0.75）。',
-    '5. 返回 JSON 格式必须严格为：',
-    '{"items":[{"sourceFileName":"文件名","values":{"字段名":值},"confidence":{"字段名":0.95},"notes":"可选补充说明"}]}',
+    '5. notes 只写「原文里有、但没有任何字段能装下」的事实，格式为「含义：内容」，多条用中文分号隔开。例如学历只能填「硕士」时，notes 写「毕业院校：浙江大学」。全部事实都能落入字段时，notes 必须为 null，禁止写识别过程、置信度或「无需跳过」这类说明。',
+    '6. 返回 JSON 格式必须严格为：',
+    '{"items":[{"sourceFileName":"文件名","values":{"字段名":值},"confidence":{"字段名":0.95},"notes":null}]}',
   ].join('\n');
 
   const compactSamples = truncateSampleRows(schema.sampleRows || []);

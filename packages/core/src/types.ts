@@ -67,7 +67,10 @@ export interface ValidatedRow {
   rowId: string;
   sourceFileName: string;
   cells: Record<string, ValidatedCell>;
+  /** Arithmetic or other row-level checks. Informational model notes live in `notes`. */
   rowWarnings: string[];
+  /** Facts from the source that did not fit any column. Empty when every fact mapped. */
+  notes?: string;
 }
 
 export interface ExtractionRawItem {

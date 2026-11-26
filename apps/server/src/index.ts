@@ -13,6 +13,7 @@ import {
   type TableSchema,
 } from '@table-ai/core';
 import { QuotaStore } from './quotaStore.js';
+import { RuntimeConfigStore, assertPublicHttpsBaseUrl } from './runtimeConfig.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -40,33 +41,53 @@ app.use(
 app.use(express.json({ limit: '5mb' }));
 
 const PORT = Number(process.env.PORT || 3001);
-const LLM_BASE_URL = (process.env.LLM_BASE_URL || 'https://dashscope.aliyuncs.com/compatible-mode/v1').replace(/\/$/, '');
-const LLM_API_KEY = process.env.LLM_API_KEY?.trim() || '';
-const LLM_MODEL = process.env.LLM_MODEL || 'qwen-vl-max-latest';
-const LLM_FREE_MODEL = process.env.LLM_FREE_MODEL?.trim() || LLM_MODEL;
-const LLM_PRO_MODEL = process.env.LLM_PRO_MODEL?.trim() || LLM_MODEL;
-
-const RAW_ADMIN_TOKEN = process.env.ADMIN_TOKEN?.trim() || '';
-const IS_MOCK_MODE = !LLM_API_KEY;
-// In local mock mode only, allow a convenient default dev token when ADMIN_TOKEN is not yet configured
-const EFFECTIVE_ADMIN_TOKEN =
-  RAW_ADMIN_TOKEN && RAW_ADMIN_TOKEN !== 'change-me-in-production'
-    ? RAW_ADMIN_TOKEN
-    : IS_MOCK_MODE
-      ? 'dev-admin-123'
-      : '';
-
-const quotaStore = new QuotaStore(path.resolve(__dirname, '../data/quota-store.json'), {
+const ENV_LLM_MODEL = process.env.LLM_MODEL?.trim() || 'qwen-vl-max-latest';
+const ENV_LLM_API_KEY = process.env.LLM_API_KEY?.trim() || '';
+const runtimeConfig = new RuntimeConfigStore(path.resolve(__dirname, '../data/runtime-config.json'), {
+  llmBaseUrl: (process.env.LLM_BASE_URL || 'https://dashscope.aliyuncs.com/compatible-mode/v1').replace(/\/$/, ''),
+  llmModel: ENV_LLM_MODEL,
+  llmFreeModel: process.env.LLM_FREE_MODEL?.trim() || '',
+  llmProModel: process.env.LLM_PRO_MODEL?.trim() || '',
+  llmApiKey: ENV_LLM_API_KEY,
   freeWelcomePages: Number(process.env.FREE_WELCOME_PAGES ?? 8),
   freeDailyPages: Number(process.env.FREE_DAILY_PAGES ?? 2),
   globalDailyFreeLimit: Number(process.env.GLOBAL_DAILY_FREE_LIMIT ?? 1000),
   ipDailyFreeLimit: Number(process.env.IP_DAILY_FREE_LIMIT ?? 30),
+  encryptionKey: process.env.CONFIG_ENCRYPTION_KEY?.trim() || '',
+});
+const bootConfig = runtimeConfig.getEffective();
+
+const RAW_ADMIN_TOKEN = process.env.ADMIN_TOKEN?.trim() || '';
+// Default dev token follows the environment key only, so saving a key in the admin console cannot lock the operator out.
+const EFFECTIVE_ADMIN_TOKEN =
+  RAW_ADMIN_TOKEN && RAW_ADMIN_TOKEN !== 'change-me-in-production'
+    ? RAW_ADMIN_TOKEN
+    : ENV_LLM_API_KEY
+      ? ''
+      : 'dev-admin-123';
+
+const quotaStore = new QuotaStore(path.resolve(__dirname, '../data/quota-store.json'), {
+  freeWelcomePages: bootConfig.freeWelcomePages,
+  freeDailyPages: bootConfig.freeDailyPages,
+  globalDailyFreeLimit: bootConfig.globalDailyFreeLimit,
+  ipDailyFreeLimit: bootConfig.ipDailyFreeLimit,
   freeMaxFiles: 3,
   proMaxFiles: 20,
   freeMaxPdfPages: 3,
   proMaxPdfPages: 10,
-  isMockMode: IS_MOCK_MODE,
+  isMockMode: !bootConfig.apiKey,
 });
+
+function applyRuntimeQuotaPolicy(): void {
+  const current = runtimeConfig.getEffective();
+  quotaStore.updateRuntimePolicy({
+    freeWelcomePages: current.freeWelcomePages,
+    freeDailyPages: current.freeDailyPages,
+    globalDailyFreeLimit: current.globalDailyFreeLimit,
+    ipDailyFreeLimit: current.ipDailyFreeLimit,
+    isMockMode: !current.apiKey,
+  });
+}
 
 function getClientIp(req: express.Request): string {
   return req.ip || req.socket.remoteAddress || 'unknown';
@@ -159,6 +180,28 @@ function parseAndValidateSchema(raw: unknown): TableSchema | null {
   }
 }
 
+/**
+ * CNY per 1M tokens, input window ≤32K. Unknown models use Doubao-Seed-2.0-lite list price.
+ * mini 0.20/2.00, lite 0.60/3.60, pro 3.20/16, Qwen3-VL-Plus 1/10.
+ */
+function estimateModelCostCny(modelName: string, promptTokens: number, completionTokens: number): number {
+  const name = modelName.toLowerCase();
+  let inputPerMillion = 0.6;
+  let outputPerMillion = 3.6;
+  if (name.includes('mini')) {
+    inputPerMillion = 0.2;
+    outputPerMillion = 2;
+  } else if (name.includes('doubao') && name.includes('pro')) {
+    inputPerMillion = 3.2;
+    outputPerMillion = 16;
+  } else if (name.includes('qwen')) {
+    inputPerMillion = 1;
+    outputPerMillion = 10;
+  }
+  const cost = (promptTokens * inputPerMillion + completionTokens * outputPerMillion) / 1_000_000;
+  return Number(cost.toFixed(4));
+}
+
 function generateMockItems(schema: TableSchema, fileNames: string[]): ExtractionRawItem[] {
   const writableFields = schema.fields.filter((f) => !f.readonly && f.type !== 'unknown');
   const results: ExtractionRawItem[] = [];
@@ -228,10 +271,6 @@ function generateMockItems(schema: TableSchema, fileNames: string[]): Extraction
         sourceFileName: fileName,
         values,
         confidence,
-        notes:
-          i === 1
-            ? 'Mock 演示模式：已故意构造低置信度或金额核对异常，展示标黄复核效果'
-            : undefined,
       });
     }
   });
@@ -249,6 +288,11 @@ async function callMultimodalLLM(
   promptTokens?: number;
   completionTokens?: number;
 }> {
+  const llm = runtimeConfig.getEffective();
+  if (!llm.apiKey) {
+    throw new Error('未配置模型密钥');
+  }
+  const baseUrl = await assertPublicHttpsBaseUrl(llm.baseUrl);
   const fileNames = files.map((f) => decodeFileName(f.originalname));
   const { systemPrompt, userPrompt } = buildExtractionPrompt(schema, fileNames, userHint);
 
@@ -291,12 +335,13 @@ async function callMultimodalLLM(
     }
   }
 
-  const response = await fetch(`${LLM_BASE_URL}/chat/completions`, {
+  const response = await fetch(`${baseUrl}/chat/completions`, {
     method: 'POST',
+    redirect: 'manual',
     signal: AbortSignal.timeout(60000),
     headers: {
       'Content-Type': 'application/json',
-      Authorization: `Bearer ${LLM_API_KEY}`,
+      Authorization: `Bearer ${llm.apiKey}`,
     },
     body: JSON.stringify({
       model: modelName,
@@ -308,6 +353,9 @@ async function callMultimodalLLM(
     }),
   });
 
+  if (response.status >= 300 && response.status < 400) {
+    throw new Error('模型服务返回了重定向，已拒绝跟随');
+  }
   if (!response.ok) {
     const errText = await response.text();
     throw new Error(`LLM API 调用失败 (${response.status}): ${errText.slice(0, 300)}`);
@@ -433,9 +481,9 @@ app.get('/admin', (_req, res) => {
 app.get('/api/health', (_req, res) => {
   res.json({
     ok: true,
-    mode: LLM_API_KEY ? 'llm' : 'mock',
-    freeModel: LLM_API_KEY ? LLM_FREE_MODEL : 'mock-demo',
-    proModel: LLM_API_KEY ? LLM_PRO_MODEL : 'mock-demo',
+    mode: runtimeConfig.getEffective().apiKey ? 'llm' : 'mock',
+    freeModel: runtimeConfig.getEffective().apiKey ? runtimeConfig.getEffective().freeModel : 'mock-demo',
+    proModel: runtimeConfig.getEffective().apiKey ? runtimeConfig.getEffective().proModel : 'mock-demo',
   });
 });
 
@@ -449,7 +497,7 @@ app.get('/api/quota', (req, res) => {
   const { userId, tenantKey } = getUserHeaders(req);
   const snapshot = quotaStore.getSnapshot(userId, tenantKey);
   res.json({
-    mode: LLM_API_KEY ? 'llm' : 'mock',
+    mode: runtimeConfig.getEffective().apiKey ? 'llm' : 'mock',
     quota: snapshot,
   });
 });
@@ -480,7 +528,7 @@ app.post('/api/quota/redeem', (req, res) => {
 app.get('/api/admin/overview', requireAdmin, (_req, res) => {
   res.json({
     ok: true,
-    mode: LLM_API_KEY ? 'llm' : 'mock',
+    mode: runtimeConfig.getEffective().apiKey ? 'llm' : 'mock',
     overview: quotaStore.getAdminOverview(),
   });
 });
@@ -541,6 +589,33 @@ app.get('/api/admin/logs', requireAdmin, (_req, res) => {
   res.json({ ok: true, logs: quotaStore.listLogs() });
 });
 
+app.get('/api/admin/settings', requireAdmin, (_req, res) => {
+  res.setHeader('Cache-Control', 'no-store');
+  res.json({ ok: true, settings: runtimeConfig.getPublicSettings() });
+});
+
+app.post('/api/admin/settings', requireAdmin, async (req, res) => {
+  try {
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const settings = await runtimeConfig.update({
+      llmBaseUrl: String(body.llmBaseUrl ?? ''),
+      llmModel: String(body.llmModel ?? ''),
+      llmFreeModel: String(body.llmFreeModel ?? ''),
+      llmProModel: String(body.llmProModel ?? ''),
+      freeWelcomePages: Number(body.freeWelcomePages),
+      freeDailyPages: Number(body.freeDailyPages),
+      globalDailyFreeLimit: Number(body.globalDailyFreeLimit),
+      ipDailyFreeLimit: Number(body.ipDailyFreeLimit),
+      llmApiKey: typeof body.llmApiKey === 'string' ? body.llmApiKey : undefined,
+      clearApiKey: body.clearApiKey === true,
+    });
+    applyRuntimeQuotaPolicy();
+    res.json({ ok: true, settings });
+  } catch (err) {
+    res.status(400).json({ error: err instanceof Error ? err.message : '保存配置失败' });
+  }
+});
+
 app.post('/api/fetch-attachment', async (req, res) => {
   const ipCheck = quotaStore.checkIpRateLimit(getClientIp(req), 'fetch_att', 20);
   if (!ipCheck.allowed) {
@@ -571,7 +646,7 @@ app.post('/api/extract', upload.array('files', 25), async (req, res) => {
   let reservationId: string | null = null;
   let reservedUserId = '';
   let reservedTier: 'free' | 'pro' = 'free';
-  let chosenModel = LLM_FREE_MODEL;
+  let chosenModel = runtimeConfig.getEffective().freeModel;
   let pageCost = 0;
 
   try {
@@ -609,7 +684,8 @@ app.post('/api/extract', upload.array('files', 25), async (req, res) => {
     reservationId = reserveRes.reservation.id;
     reservedUserId = reserveRes.reservation.userId;
     reservedTier = reserveRes.reservation.plan.useProModel ? 'pro' : 'free';
-    chosenModel = reserveRes.reservation.plan.useProModel ? LLM_PRO_MODEL : LLM_FREE_MODEL;
+    const llm = runtimeConfig.getEffective();
+    chosenModel = reserveRes.reservation.plan.useProModel ? llm.proModel : llm.freeModel;
 
     const userHint = typeof req.body?.userHint === 'string' ? req.body.userHint : undefined;
     const fileNames = files.map((f) => decodeFileName(f.originalname));
@@ -619,7 +695,7 @@ app.post('/api/extract', upload.array('files', 25), async (req, res) => {
     let promptTokens = 0;
     let completionTokens = 0;
 
-    if (LLM_API_KEY) {
+    if (llm.apiKey) {
       mode = 'llm';
       const llmRes = await callMultimodalLLM(chosenModel, schema, files, userHint);
       items = llmRes.items;
@@ -635,9 +711,7 @@ app.post('/api/extract', upload.array('files', 25), async (req, res) => {
     reservationId = null;
 
     const estimatedCostCny =
-      mode === 'llm'
-        ? Number(((promptTokens / 1000) * 0.003 + (completionTokens / 1000) * 0.009).toFixed(4))
-        : 0;
+      mode === 'llm' ? estimateModelCostCny(chosenModel, promptTokens, completionTokens) : 0;
 
     quotaStore.recordLog({
       userId: reservedUserId,
@@ -652,7 +726,7 @@ app.post('/api/extract', upload.array('files', 25), async (req, res) => {
 
     const payload: ExtractResponse = {
       mode,
-      model: mode === 'llm' ? chosenModel : 'mock-demo（未配置 LLM_API_KEY）',
+      model: mode === 'llm' ? chosenModel : 'mock-demo（未配置模型密钥）',
       rows: validatedRows,
       estimatedCostCny,
       consumedPages: pageCost,
@@ -667,8 +741,8 @@ app.post('/api/extract', upload.array('files', 25), async (req, res) => {
       quotaStore.recordLog({
         userId: reservedUserId || 'unknown',
         tier: reservedTier,
-        mode: LLM_API_KEY ? 'llm' : 'mock',
-        model: LLM_API_KEY ? chosenModel : 'mock-demo',
+        mode: runtimeConfig.getEffective().apiKey ? 'llm' : 'mock',
+        model: runtimeConfig.getEffective().apiKey ? chosenModel : 'mock-demo',
         pages: pageCost,
         rowsExtracted: 0,
         estimatedCostCny: 0,
@@ -712,12 +786,13 @@ app.use(
 );
 
 app.listen(PORT, () => {
+  const llm = runtimeConfig.getEffective();
   console.log(`[any-to-sheet-server] running at http://localhost:${PORT}`);
   console.log(`[any-to-sheet-server] admin console: http://localhost:${PORT}/admin`);
   console.log(
-    `[any-to-sheet-server] mode: ${LLM_API_KEY ? `LLM (free=${LLM_FREE_MODEL}, pro=${LLM_PRO_MODEL})` : 'MOCK DEMO (默认开发后台密钥: dev-admin-123)'}`
+    `[any-to-sheet-server] mode: ${llm.apiKey ? `LLM (free=${llm.freeModel}, pro=${llm.proModel}, key=${llm.apiKeySource})` : 'MOCK DEMO (默认开发后台密钥: dev-admin-123)'}`
   );
   console.log(
-    `[any-to-sheet-server] quota policy: welcome=${process.env.FREE_WELCOME_PAGES ?? 8} + daily=${process.env.FREE_DAILY_PAGES ?? 2} pages/day, ipDailyCap=${process.env.IP_DAILY_FREE_LIMIT ?? 30}, globalDailyFreeCap=${process.env.GLOBAL_DAILY_FREE_LIMIT ?? 1000}, trustProxy=${TRUST_PROXY}`
+    `[any-to-sheet-server] quota policy: welcome=${llm.freeWelcomePages} + daily=${llm.freeDailyPages} pages/day, ipDailyCap=${llm.ipDailyFreeLimit}, globalDailyFreeCap=${llm.globalDailyFreeLimit}, trustProxy=${TRUST_PROXY}, configEncryption=${runtimeConfig.encryptionReady}`
   );
 });

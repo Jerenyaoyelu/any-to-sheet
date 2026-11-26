@@ -208,6 +208,20 @@
       .toast-ok { background: #e8ffea; color: #008026; }
       .toast-err { background: #ffece8; color: #cb2634; }
       .hidden { display: none !important; }
+      .form-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+        gap: 10px 14px;
+      }
+      .field { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--muted); }
+      .field .input { width: 100%; box-sizing: border-box; }
+      .check-line { display: flex; align-items: center; gap: 6px; font-size: 12px; }
+      .audit-list {
+        font-size: 12px;
+        color: var(--muted);
+        white-space: pre-wrap;
+        line-height: 1.6;
+      }
     </style>
   </head>
   <body>
@@ -269,6 +283,7 @@
         <button class="tab active" data-tab="codes">激活码发卡中心</button>
         <button class="tab" data-tab="users">用户与额度管理</button>
         <button class="tab" data-tab="logs">最近调用流水</button>
+        <button class="tab" data-tab="settings">运行配置</button>
       </div>
 
       <!-- Tab 1: Codes -->
@@ -358,6 +373,56 @@
         </div>
       </div>
 
+      <!-- Tab 4: Runtime settings -->
+      <div id="tab-settings" class="card hidden">
+        <div>
+          <strong>模型与免费额度</strong>
+          <p class="muted" style="margin:6px 0 0;">保存后立即生效。登录密钥、端口、反向代理和跨域来源仍只放在服务器环境变量里。</p>
+        </div>
+        <div class="form-grid">
+          <label class="field">模型地址
+            <input id="cfgBaseUrl" class="input" type="url" placeholder="https://ark.cn-beijing.volces.com/api/v3" />
+          </label>
+          <label class="field">默认模型 / 接入点
+            <input id="cfgModel" class="input" type="text" placeholder="ep-xxxxxxxx" />
+          </label>
+          <label class="field">免费用户模型（留空则跟随默认）
+            <input id="cfgFreeModel" class="input" type="text" placeholder="留空使用默认模型" />
+          </label>
+          <label class="field">Pro 用户模型（留空则跟随默认）
+            <input id="cfgProModel" class="input" type="text" placeholder="留空使用默认模型" />
+          </label>
+          <label class="field">新人体验页数
+            <input id="cfgWelcome" class="input" type="number" min="0" max="10000" step="1" />
+          </label>
+          <label class="field">每日免费页数
+            <input id="cfgDaily" class="input" type="number" min="0" max="10000" step="1" />
+          </label>
+          <label class="field">全站每日免费上限
+            <input id="cfgGlobal" class="input" type="number" min="0" max="1000000" step="1" />
+          </label>
+          <label class="field">单 IP 每日免费上限
+            <input id="cfgIp" class="input" type="number" min="0" max="100000" step="1" />
+          </label>
+        </div>
+        <label class="field">模型密钥
+          <input id="cfgApiKey" class="input" type="password" autocomplete="new-password" placeholder="留空表示不修改" />
+        </label>
+        <div id="cfgKeyStatus" class="muted"></div>
+        <label class="check-line">
+          <input id="cfgClearKey" type="checkbox" />
+          清除已保存的模型密钥（清除后不再回退到环境变量里的密钥）
+        </label>
+        <div id="cfgEncryptNote" class="muted"></div>
+        <div>
+          <button id="cfgSaveBtn" class="btn btn-primary">保存配置</button>
+        </div>
+        <div>
+          <strong>最近变更</strong>
+          <div id="cfgAudit" class="audit-list"></div>
+        </div>
+      </div>
+
       <!-- Tab 3: Logs -->
       <div id="tab-logs" class="card hidden">
         <strong>最近提取流水（最新 200 条）</strong>
@@ -428,11 +493,12 @@
       }
 
       async function loadAll() {
-        const [ov, us, cs, lg] = await Promise.all([
+        const [ov, us, cs, lg, st] = await Promise.all([
           api('/api/admin/overview'),
           api('/api/admin/users'),
           api('/api/admin/codes'),
           api('/api/admin/logs'),
+          api('/api/admin/settings'),
         ]);
 
         const o = ov.overview;
@@ -461,6 +527,33 @@
         renderCodes();
         renderUsers();
         renderLogs(lg.logs || []);
+        renderSettings(st.settings || {});
+      }
+
+      function renderSettings(s) {
+        document.getElementById('cfgBaseUrl').value = s.llmBaseUrl || '';
+        document.getElementById('cfgModel').value = s.llmModel || '';
+        document.getElementById('cfgFreeModel').value = s.llmFreeModel || '';
+        document.getElementById('cfgProModel').value = s.llmProModel || '';
+        document.getElementById('cfgWelcome').value = s.freeWelcomePages ?? 0;
+        document.getElementById('cfgDaily').value = s.freeDailyPages ?? 0;
+        document.getElementById('cfgGlobal').value = s.globalDailyFreeLimit ?? 0;
+        document.getElementById('cfgIp').value = s.ipDailyFreeLimit ?? 0;
+        document.getElementById('cfgApiKey').value = '';
+        document.getElementById('cfgClearKey').checked = false;
+        const sourceText =
+          s.apiKeySource === 'admin'
+            ? '（来自后台）'
+            : s.apiKeySource === 'env'
+              ? '（来自环境变量，保存新密钥后改由后台接管）'
+              : s.apiKeySource === 'unreadable'
+                ? '（无法解密）'
+                : '';
+        document.getElementById('cfgKeyStatus').textContent = (s.apiKeyHint || '未配置') + sourceText;
+        document.getElementById('cfgEncryptNote').textContent = s.encryptionHint || '';
+        document.getElementById('cfgApiKey').disabled = !s.encryptionReady;
+        const audit = (s.audit || []).map((item) => fmtTime(item.at) + '  ' + item.summary);
+        document.getElementById('cfgAudit').textContent = audit.length ? audit.join('\n') : '还没有配置变更记录';
       }
 
       function renderCodes() {
@@ -651,7 +744,7 @@
           document.querySelectorAll('.tab').forEach((b) => b.classList.remove('active'));
           btn.classList.add('active');
           const target = btn.dataset.tab;
-          ['codes', 'users', 'logs'].forEach((t) => {
+          ['codes', 'users', 'logs', 'settings'].forEach((t) => {
             document.getElementById('tab-' + t).classList.toggle('hidden', t !== target);
           });
         };
@@ -681,6 +774,39 @@
           document.getElementById('freshCodesList').textContent = freshGenerated.join('\n');
           document.getElementById('freshCodesBox').classList.remove('hidden');
           showToast('成功生成 ' + freshGenerated.length + ' 个激活码！');
+          await loadAll();
+        } catch (err) {
+          showToast(err.message, true);
+        }
+      };
+
+      document.getElementById('cfgSaveBtn').onclick = async () => {
+        const clearApiKey = document.getElementById('cfgClearKey').checked;
+        const llmApiKey = document.getElementById('cfgApiKey').value;
+        if (clearApiKey && llmApiKey.trim()) {
+          showToast('不能同时填写新密钥和清除密钥', true);
+          return;
+        }
+        if (clearApiKey && !window.confirm('清除后不再使用环境变量里的模型密钥。没有新密钥时，服务会回到 Mock 演示。确定清除？')) {
+          return;
+        }
+        try {
+          const data = await api('/api/admin/settings', {
+            method: 'POST',
+            body: JSON.stringify({
+              llmBaseUrl: document.getElementById('cfgBaseUrl').value.trim(),
+              llmModel: document.getElementById('cfgModel').value.trim(),
+              llmFreeModel: document.getElementById('cfgFreeModel').value.trim(),
+              llmProModel: document.getElementById('cfgProModel').value.trim(),
+              freeWelcomePages: Number(document.getElementById('cfgWelcome').value),
+              freeDailyPages: Number(document.getElementById('cfgDaily').value),
+              globalDailyFreeLimit: Number(document.getElementById('cfgGlobal').value),
+              ipDailyFreeLimit: Number(document.getElementById('cfgIp').value),
+              llmApiKey,
+              clearApiKey,
+            }),
+          });
+          showToast(data.settings && data.settings.usingMock ? '已保存，当前没有可用模型密钥' : '配置已保存并立即生效');
           await loadAll();
         } catch (err) {
           showToast(err.message, true);

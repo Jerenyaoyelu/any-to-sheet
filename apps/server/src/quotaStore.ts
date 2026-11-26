@@ -129,6 +129,28 @@ export class QuotaStore {
     this.data = this.load();
   }
 
+  /** Apply admin-console quota and mock-mode changes without restarting. */
+  updateRuntimePolicy(
+    patch: Partial<
+      Pick<
+        QuotaConfig,
+        | 'freeWelcomePages'
+        | 'freeDailyPages'
+        | 'globalDailyFreeLimit'
+        | 'ipDailyFreeLimit'
+        | 'isMockMode'
+      >
+    >
+  ): void {
+    if (patch.freeWelcomePages !== undefined) this.config.freeWelcomePages = patch.freeWelcomePages;
+    if (patch.freeDailyPages !== undefined) this.config.freeDailyPages = patch.freeDailyPages;
+    if (patch.globalDailyFreeLimit !== undefined) {
+      this.config.globalDailyFreeLimit = patch.globalDailyFreeLimit;
+    }
+    if (patch.ipDailyFreeLimit !== undefined) this.config.ipDailyFreeLimit = patch.ipDailyFreeLimit;
+    if (patch.isMockMode !== undefined) this.config.isMockMode = patch.isMockMode;
+  }
+
   private load(): PersistedStore {
     const today = getTodayStr();
     const empty: PersistedStore = {

@@ -315,13 +315,12 @@ export function revalidateEditedRow(
   }
   updatedCells[editedFieldId] = revalidated;
 
-  const preservedNotes = row.rowWarnings.filter((w) => !w.startsWith('数值校验异常：'));
   const mathWarnings = runArithmeticConsistencyCheck(schema, updatedCells);
 
   return {
     ...row,
     cells: updatedCells,
-    rowWarnings: [...mathWarnings, ...preservedNotes],
+    rowWarnings: mathWarnings,
   };
 }
 
@@ -353,15 +352,14 @@ export function validateExtractionItems(
     }
 
     const rowWarnings = runArithmeticConsistencyCheck(schema, cells);
-    if (item?.notes) {
-      rowWarnings.push(`AI 备注：${item.notes}`);
-    }
+    const notes = typeof item?.notes === 'string' ? item.notes.trim() : '';
 
     return {
       rowId: `row_${Date.now()}_${idx}`,
       sourceFileName: item?.sourceFileName || '未知文件',
       cells,
       rowWarnings,
+      notes: notes || undefined,
     };
   });
 }

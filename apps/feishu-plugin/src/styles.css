@@ -277,6 +277,86 @@ body {
   font-size: 12px;
   line-height: 1.45;
   word-break: break-word;
+  background: #fffbe6;
+  border: 1px solid #ffe58f;
+  border-radius: 8px;
+  padding: 6px 8px;
+}
+
+.notes-summary {
+  background: #f2f3f5;
+  border-radius: 8px;
+  padding: 6px 8px;
+  font-size: 12px;
+  line-height: 1.45;
+  word-break: break-word;
+}
+
+.review-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.review-card {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.review-card-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.review-card-head .source-cell {
+  flex: 1;
+  max-width: none;
+}
+
+.review-field {
+  display: grid;
+  grid-template-columns: 88px minmax(0, 1fr);
+  gap: 6px;
+  align-items: center;
+  border-radius: 6px;
+  padding: 2px;
+}
+
+.review-field-warn {
+  background: var(--warn-bg);
+  box-shadow: inset 0 0 0 1px var(--warn-border);
+}
+
+.review-field-name {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.3;
+}
+
+.review-field .cell-input {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 4px 6px;
+  background: #fff;
+}
+
+.multi-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 10px;
+  align-items: center;
+}
+
+.multi-options label {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
 }
 
 .preview-table-wrap {

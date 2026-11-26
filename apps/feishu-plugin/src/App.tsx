@@ -32,6 +32,78 @@ const FIELD_TYPE_LABEL: Record<string, string> = {
 type InputSourceTab = 'upload' | 'attachment';
 type AlertMessage = { type: 'info' | 'success' | 'error'; text: string };
 
+function quotaHint(quota: QuotaSnapshot): string {
+  const parts: string[] = [];
+  if (quota.dailyRemaining <= 0 && quota.totalAvailable > 0) {
+    parts.push('今日免费已用完');
+  } else {
+    parts.push(`今日免费 ${quota.dailyRemaining}/${quota.dailyLimit}`);
+  }
+  if (quota.welcomeRemaining > 0) parts.push(`新人 ${quota.welcomeRemaining}`);
+  if (quota.paidRemaining > 0) parts.push(`永久 ${quota.paidRemaining}`);
+  return parts.join(' · ');
+}
+
+function isMoneyField(name: string): boolean {
+  return /金额|单价|总价|合计|小计|价格|费用|实付|售价/.test(name);
+}
+
+function formatMoney(value: unknown): string {
+  if (typeof value === 'number' && Number.isFinite(value)) return value.toFixed(2);
+  if (value === null || value === undefined) return '';
+  return String(value);
+}
+
+function selectedNames(value: unknown): string[] {
+  if (Array.isArray(value)) return value.map((item) => String(item).trim()).filter(Boolean);
+  if (typeof value === 'string' && value.trim()) {
+    return value
+      .split(/[,，、;；]/)
+      .map((item) => item.trim())
+      .filter(Boolean);
+  }
+  return [];
+}
+
+function reviewTitle(rowCount: number, issueCount: number, noteCount: number): string {
+  const base = `3. 提取预览与复核（${rowCount} 条`;
+  if (issueCount > 0 && noteCount > 0) return `${base}，${issueCount} 处标黄，另有未入表信息）`;
+  if (issueCount > 0) return `${base}，${issueCount} 处标黄待复核）`;
+  if (noteCount > 0) return `${base}，有未入表信息）`;
+  return `${base}，全部校验通过）`;
+}
+
+function MoneyInput({
+  value,
+  title,
+  onCommit,
+}: {
+  value: unknown;
+  title?: string;
+  onCommit: (raw: string) => void;
+}) {
+  const [focused, setFocused] = useState(false);
+  const [draft, setDraft] = useState('');
+  const shown = formatMoney(value);
+  return (
+    <input
+      className="cell-input"
+      title={title}
+      inputMode="decimal"
+      value={focused ? draft : shown}
+      onFocus={() => {
+        setFocused(true);
+        setDraft(shown);
+      }}
+      onChange={(e) => setDraft(e.target.value)}
+      onBlur={() => {
+        setFocused(false);
+        if (draft !== shown) onCommit(draft);
+      }}
+    />
+  );
+}
+
 async function safeParseJson(res: Response): Promise<Record<string, unknown>> {
   const text = await res.text();
   try {
@@ -170,6 +242,9 @@ export default function App() {
     return list;
   }, [rows]);
 
+  const noteCount = useMemo(() => rows.filter((r) => r.notes?.trim()).length, [rows]);
+  const issueCount = warningCount + allRowWarnings.length;
+
   const maxFilesAllowed = quota?.maxFilesPerRequest ?? 3;
   const maxPdfAllowed = quota?.maxPdfPages ?? 3;
   const activeCount = sourceTab === 'upload' ? files.length : selectedAttIds.length;
@@ -180,6 +255,7 @@ export default function App() {
       if (isMock && nextDemoKey && adapter instanceof MockHostAdapter) {
         adapter.setDemoSchema(nextDemoKey);
         setDemoKey(nextDemoKey);
+        setUserHint('');
       }
       const nextSchema = await adapter.getActiveTableSchema();
       setSchema(nextSchema);
@@ -372,9 +448,10 @@ export default function App() {
       setRows(typed.rows);
       const skipNote =
         skippedPdfPages > 0 ? `（有 ${skippedPdfPages} 页超出单份 PDF 上限已跳过）` : '';
+      const unmapped = typed.rows.some((row) => row.notes?.trim()) ? '有未入表信息，' : '';
       setMessage({
         type: 'info',
-        text: `已提取 ${typed.rows.length} 条记录${skipNote}（消耗 ${typed.consumedPages} 页，剩余 ${typed.quota.totalAvailable} 页），请核对标黄项后写入表格。`,
+        text: `已提取 ${typed.rows.length} 条记录${skipNote}（消耗 ${typed.consumedPages} 页，剩余 ${typed.quota.totalAvailable} 页），${unmapped}请核对后再写入表格。`,
       });
     } catch (err) {
       setMessage({
@@ -412,7 +489,7 @@ export default function App() {
       setMessage({
         type: 'success',
         text: isMock
-          ? `模拟写入成功！共写入 ${writtenCount} 条记录到「${schema.tableName}」（接入飞书侧边栏后将直接写入真实多维表格）。`
+          ? `试写成功。${writtenCount} 条已记在本地「${schema.tableName}」，接入飞书侧边栏后才会写入真实多维表格。`
           : `成功写入 ${writtenCount} 条记录到飞书多维表格「${schema.tableName}」！`,
       });
     } catch (err) {
@@ -432,8 +509,8 @@ export default function App() {
           <h1>AnyToSheet 万物入表</h1>
           <p className="subtitle">自动读取表头 · 扫描版 PDF 转高清图 · 附件列批量提取 · 标黄校验复核</p>
         </div>
-        <span className={`badge ${isMock ? 'badge-mock' : 'badge-live'}`}>
-          {isMock ? '本地演示' : '飞书已连接'}
+        <span className={`badge ${!isMock || serverMode === 'llm' ? 'badge-live' : 'badge-mock'}`}>
+          {!isMock ? '飞书已连接' : serverMode === 'llm' ? '本地联调 · 真实模型' : '本地演示 · Mock'}
         </span>
       </header>
 
@@ -447,11 +524,7 @@ export default function App() {
             <span>
               可用 <strong>{quota.totalAvailable}</strong> 页
             </span>
-            <small className="muted">
-              （今日 {quota.dailyRemaining}/{quota.dailyLimit}
-              {quota.welcomeRemaining > 0 ? ` · 新人 ${quota.welcomeRemaining}` : ''}
-              {quota.paidRemaining > 0 ? ` · 永久 ${quota.paidRemaining}` : ''}）
-            </small>
+            <small className="muted">（{quotaHint(quota)}）</small>
           </div>
           <button
             className="btn btn-ghost"
@@ -703,10 +776,7 @@ export default function App() {
       {rows.length > 0 && (
         <section className="card">
           <div className="card-header">
-            <strong>
-              3. 提取预览与复核（{rows.length} 条
-              {warningCount > 0 ? `，${warningCount} 处标黄待复核` : '，全部校验通过'}）
-            </strong>
+            <strong>{reviewTitle(rows.length, issueCount, noteCount)}</strong>
             <div className="row-actions">
               {extractResult && extractResult.mode === 'llm' && (
                 <span className="muted">约 ¥{extractResult.estimatedCostCny}</span>
@@ -724,82 +794,121 @@ export default function App() {
             </div>
           </div>
 
-          {/* Dedicated full-width warning box outside horizontally-scrolling table */}
-          {allRowWarnings.length > 0 && (
-            <div className="warnings-summary">
-              {allRowWarnings.map((w, idx) => (
-                <div key={idx} className="warning-item">
-                  ⚠️ 第 {w.rowNum} 行：{w.text}
+          <div className="review-list">
+            {rows.map((row, rowIndex) => (
+              <article key={row.rowId} className="review-card">
+                <div className="review-card-head">
+                  <span className="row-num">第 {rowIndex + 1} 条</span>
+                  <span className="source-cell" title={row.sourceFileName}>
+                    {row.sourceFileName}
+                  </span>
+                  <button className="link-danger" onClick={() => handleDeleteRow(row.rowId)}>
+                    删行
+                  </button>
                 </div>
-              ))}
-            </div>
-          )}
 
-          <div className="preview-table-wrap">
-            <table className="preview-table">
-              <thead>
-                <tr>
-                  <th>#</th>
-                  <th>来源文件</th>
-                  {writableFields.map((f) => (
-                    <th key={f.id}>{f.name}</th>
-                  ))}
-                  <th>操作</th>
-                </tr>
-              </thead>
-              <tbody>
-                {rows.map((row, rowIndex) => (
-                  <tr key={row.rowId}>
-                    <td className="row-num">{rowIndex + 1}</td>
-                    <td className="source-cell" title={row.sourceFileName}>
-                      {row.sourceFileName}
-                    </td>
-                    {writableFields.map((f) => {
-                      const cell = row.cells[f.id];
-                      const isWarn = cell && cell.status !== 'ok';
-                      const tooltip =
-                        cell?.reason ||
-                        `置信度 ${Math.round((cell?.confidence ?? 0.9) * 100)}%`;
+                {row.notes?.trim() && (
+                  <div className="notes-summary">未入表：{row.notes}</div>
+                )}
+                {row.rowWarnings.map((warning, warningIndex) => (
+                  <div key={`${row.rowId}-${warningIndex}`} className="warning-item">
+                    {warning}
+                  </div>
+                ))}
 
-                      if (f.type === 'checkbox') {
-                        return (
-                          <td
-                            key={f.id}
-                            className={`cell-center ${isWarn ? 'cell-warning' : ''}`}
-                            title={tooltip}
-                          >
+                {writableFields.map((f) => {
+                  const cell = row.cells[f.id];
+                  const isWarn = cell && cell.status !== 'ok';
+                  const tooltip =
+                    cell?.reason || `置信度 ${Math.round((cell?.confidence ?? 0.9) * 100)}%`;
+                  const optionNames = f.options?.map((option) => option.name) ?? [];
+
+                  let control: React.ReactNode;
+                  if (f.type === 'checkbox') {
+                    control = (
+                      <input
+                        type="checkbox"
+                        checked={Boolean(cell?.value)}
+                        onChange={(e) => handleCellEdit(row.rowId, f.id, e.target.checked)}
+                      />
+                    );
+                  } else if (f.type === 'singleSelect' && optionNames.length > 0) {
+                    const current = cell?.value == null ? '' : String(cell.value);
+                    const known = optionNames.includes(current);
+                    control = (
+                      <select
+                        className="cell-input"
+                        title={tooltip}
+                        value={current}
+                        onChange={(e) => handleCellEdit(row.rowId, f.id, e.target.value)}
+                      >
+                        <option value="">请选择</option>
+                        {f.options!.map((option) => (
+                          <option key={option.id} value={option.name}>
+                            {option.name}
+                          </option>
+                        ))}
+                        {current && !known && <option value={current}>{current}（不在选项中）</option>}
+                      </select>
+                    );
+                  } else if (f.type === 'multiSelect' && optionNames.length > 0) {
+                    const picked = selectedNames(cell?.value);
+                    const unknown = picked.filter((name) => !optionNames.includes(name));
+                    control = (
+                      <div className="multi-options" title={tooltip}>
+                        {f.options!.map((option) => (
+                          <label key={option.id}>
                             <input
                               type="checkbox"
-                              checked={Boolean(cell?.value)}
-                              onChange={(e) => handleCellEdit(row.rowId, f.id, e.target.checked)}
+                              checked={picked.includes(option.name)}
+                              onChange={(e) => {
+                                const next = e.target.checked
+                                  ? [...picked, option.name]
+                                  : picked.filter((name) => name !== option.name);
+                                handleCellEdit(row.rowId, f.id, next);
+                              }}
                             />
-                          </td>
-                        );
-                      }
+                            {option.name}
+                          </label>
+                        ))}
+                        {unknown.length > 0 && (
+                          <span className="muted">未匹配：{unknown.join('、')}</span>
+                        )}
+                      </div>
+                    );
+                  } else if (f.type === 'number' && isMoneyField(f.name)) {
+                    control = (
+                      <MoneyInput
+                        value={cell?.value}
+                        title={tooltip}
+                        onCommit={(raw) => handleCellEdit(row.rowId, f.id, raw)}
+                      />
+                    );
+                  } else {
+                    const displayVal = Array.isArray(cell?.value)
+                      ? cell.value.join(', ')
+                      : cell?.value ?? '';
+                    control = (
+                      <input
+                        className="cell-input"
+                        title={tooltip}
+                        value={String(displayVal)}
+                        onChange={(e) => handleCellEdit(row.rowId, f.id, e.target.value)}
+                      />
+                    );
+                  }
 
-                      const displayVal = Array.isArray(cell?.value)
-                        ? cell.value.join(', ')
-                        : cell?.value ?? '';
-
-                      return (
-                        <td key={f.id} className={isWarn ? 'cell-warning' : ''} title={tooltip}>
-                          <input
-                            className="cell-input"
-                            value={String(displayVal)}
-                            onChange={(e) => handleCellEdit(row.rowId, f.id, e.target.value)}
-                          />
-                        </td>
-                      );
-                    })}
-                    <td>
-                      <button className="link-danger" onClick={() => handleDeleteRow(row.rowId)}>
-                        删行
-                      </button>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+                  return (
+                    <div key={f.id} className={`review-field ${isWarn ? 'review-field-warn' : ''}`}>
+                      <span className="review-field-name" title={tooltip}>
+                        {f.name}
+                      </span>
+                      {control}
+                    </div>
+                  );
+                })}
+              </article>
+            ))}
           </div>
 
           <button
@@ -810,10 +919,14 @@ export default function App() {
             {writing
               ? '正在写入表格...'
               : writtenDone
-                ? `已写入表格（${rows.length} 条，防重复提交已锁定）`
-                : warningCount > 0
-                  ? `确认并写入表格（${rows.length} 条，含 ${warningCount} 处标黄）`
-                  : `一键批量写入表格（${rows.length} 条）`}
+                ? isMock
+                  ? `试写成功（${rows.length} 条，未写入飞书）`
+                  : `已写入表格（${rows.length} 条，防重复提交已锁定）`
+                : issueCount > 0
+                  ? `确认并写入表格（${rows.length} 条，含 ${issueCount} 处标黄）`
+                  : noteCount > 0
+                    ? `确认并写入表格（${rows.length} 条，含未入表信息）`
+                    : `一键批量写入表格（${rows.length} 条）`}
           </button>
         </section>
       )}
