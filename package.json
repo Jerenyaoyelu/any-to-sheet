@@ -1,0 +1,13 @@
+{
+  "name": "any-to-sheet",
+  "private": true,
+  "version": "0.1.0",
+  "description": "AnyToSheet (万物入表) - Multi-host AI Table Extraction & Cleaning Plugin (Feishu Bitable first, WPS/Excel ready)",
+  "packageManager": "pnpm@10.28.2",
+  "scripts": {
+    "dev:server": "pnpm --filter @table-ai/server dev",
+    "dev:feishu": "pnpm --filter @table-ai/feishu-plugin dev",
+    "build": "pnpm -r build",
+    "typecheck": "pnpm -r typecheck"
+  }
+}
