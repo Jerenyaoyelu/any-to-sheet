@@ -1,4 +1,10 @@
-import type { HostAdapter, HostAttachmentItem, TableSchema, ValidatedRow } from '@table-ai/core';
+import type {
+  HostAdapter,
+  HostAttachmentItem,
+  TableSchema,
+  UserIdentity,
+  ValidatedRow,
+} from '@table-ai/core';
 
 export const DEMO_SCHEMAS: Record<string, TableSchema> = {
   quote: {
@@ -147,6 +153,16 @@ export class MockHostAdapter implements HostAdapter {
 
   getDemoKey() {
     return this.activeKey;
+  }
+
+  async getUserIdentity(): Promise<UserIdentity> {
+    const key = 'any_to_sheet_mock_uid';
+    let uid = window.localStorage.getItem(key);
+    if (!uid) {
+      uid = `mock_${Math.random().toString(36).slice(2, 10)}`;
+      window.localStorage.setItem(key, uid);
+    }
+    return { userId: uid, tenantKey: 'mock_tenant' };
   }
 
   async getActiveTableSchema(): Promise<TableSchema> {

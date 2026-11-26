@@ -368,3 +368,44 @@ body {
   color: var(--muted);
   white-space: nowrap;
 }
+
+.quota-bar {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 9px 12px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.quota-info {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.tier-pill {
+  padding: 2px 7px;
+  border-radius: 4px;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.tier-free {
+  background: #f2f3f5;
+  color: #4e5969;
+}
+
+.tier-pro {
+  background: linear-gradient(135deg, #ff9a2e, #ff5d00);
+  color: #ffffff;
+}
+
+.redeem-card {
+  border-color: #bcd4ff;
+  background: #f7faff;
+}

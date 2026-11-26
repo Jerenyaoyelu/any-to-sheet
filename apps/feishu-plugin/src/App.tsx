@@ -3,7 +3,9 @@ import type {
   ExtractResponse,
   HostAdapter,
   HostAttachmentItem,
+  QuotaSnapshot,
   TableSchema,
+  UserIdentity,
   ValidatedRow,
 } from '@table-ai/core';
 import { FeishuHostAdapter, isInsideFeishuBitable } from './adapters/feishuAdapter';
@@ -30,8 +32,15 @@ type InputSourceTab = 'upload' | 'attachment';
 
 export default function App() {
   const [adapter, setAdapter] = useState<HostAdapter | null>(null);
+  const [identity, setIdentity] = useState<UserIdentity | null>(null);
   const [isMock, setIsMock] = useState(false);
+  const [serverMode, setServerMode] = useState<'llm' | 'mock'>('mock');
   const [demoKey, setDemoKey] = useState<keyof typeof DEMO_SCHEMAS>('quote');
+
+  const [quota, setQuota] = useState<QuotaSnapshot | null>(null);
+  const [showRedeem, setShowRedeem] = useState(false);
+  const [redeemInput, setRedeemInput] = useState('');
+  const [redeeming, setRedeeming] = useState(false);
 
   const [schema, setSchema] = useState<TableSchema | null>(null);
   const [sourceTab, setSourceTab] = useState<InputSourceTab>('upload');
@@ -45,7 +54,7 @@ export default function App() {
   const [selectedAttIds, setSelectedAttIds] = useState<string[]>([]);
   const [scanningAtt, setScanningAtt] = useState(false);
 
-  const [maxPdfPages, setMaxPdfPages] = useState(5);
+  const [maxPdfPages, setMaxPdfPages] = useState(3);
   const [userHint, setUserHint] = useState('');
 
   const [loading, setLoading] = useState(false);
@@ -57,6 +66,28 @@ export default function App() {
 
   const fileInputRef = useRef<HTMLInputElement>(null);
 
+  function buildIdentityHeaders(idObj: UserIdentity | null): Record<string, string> {
+    const headers: Record<string, string> = {};
+    if (idObj?.userId) headers['x-user-id'] = idObj.userId;
+    if (idObj?.tenantKey) headers['x-tenant-key'] = idObj.tenantKey;
+    return headers;
+  }
+
+  async function fetchQuota(idObj: UserIdentity) {
+    try {
+      const res = await fetch('/api/quota', {
+        headers: buildIdentityHeaders(idObj),
+      });
+      if (!res.ok) return;
+      const data = (await res.json()) as { mode: 'llm' | 'mock'; quota: QuotaSnapshot };
+      setServerMode(data.mode);
+      setQuota(data.quota);
+      setMaxPdfPages((prev) => Math.min(prev, data.quota.maxPdfPages));
+    } catch {
+      // Backend might be offline; handled on extract
+    }
+  }
+
   function syncDefaultAttachmentField(nextSchema: TableSchema) {
     const firstAtt = nextSchema.attachmentFields?.[0]?.id || '';
     setSelectedAttFieldId(firstAtt);
@@ -67,21 +98,21 @@ export default function App() {
   useEffect(() => {
     (async () => {
       const inFeishu = await isInsideFeishuBitable();
-      if (inFeishu) {
-        const feishu = new FeishuHostAdapter();
-        setAdapter(feishu);
-        setIsMock(false);
-        const s = await feishu.getActiveTableSchema();
-        setSchema(s);
-        syncDefaultAttachmentField(s);
-      } else {
-        const mock = new MockHostAdapter();
-        setAdapter(mock);
-        setIsMock(true);
-        const s = await mock.getActiveTableSchema();
-        setSchema(s);
-        syncDefaultAttachmentField(s);
-      }
+      const activeAdapter: HostAdapter = inFeishu ? new FeishuHostAdapter() : new MockHostAdapter();
+      setAdapter(activeAdapter);
+      setIsMock(!inFeishu);
+
+      const [nextSchema, nextId] = await Promise.all([
+        activeAdapter.getActiveTableSchema(),
+        activeAdapter.getUserIdentity
+          ? activeAdapter.getUserIdentity()
+          : Promise.resolve({ userId: 'anonymous' }),
+      ]);
+
+      setSchema(nextSchema);
+      setIdentity(nextId);
+      syncDefaultAttachmentField(nextSchema);
+      await fetchQuota(nextId);
     })();
   }, []);
 
@@ -100,6 +131,8 @@ export default function App() {
     return count;
   }, [rows]);
 
+  const maxFilesAllowed = quota?.maxFilesPerRequest ?? 3;
+  const maxPdfAllowed = quota?.maxPdfPages ?? 3;
   const activeCount = sourceTab === 'upload' ? files.length : selectedAttIds.length;
 
   async function handleRefreshSchema(nextDemoKey?: keyof typeof DEMO_SCHEMAS) {
@@ -119,7 +152,7 @@ export default function App() {
   function handleFileChange(fileList: FileList | null) {
     if (!fileList) return;
     const incoming = Array.from(fileList);
-    setFiles((prev) => [...prev, ...incoming].slice(0, 10));
+    setFiles((prev) => [...prev, ...incoming].slice(0, maxFilesAllowed));
     setMessage(null);
   }
 
@@ -134,7 +167,7 @@ export default function App() {
     try {
       const list = await adapter.readAttachmentsFromField(selectedAttFieldId);
       setAttachments(list);
-      setSelectedAttIds(list.slice(0, 10).map((a) => a.id));
+      setSelectedAttIds(list.slice(0, maxFilesAllowed).map((a) => a.id));
       if (list.length === 0) {
         setMessage({
           type: 'info',
@@ -157,6 +190,40 @@ export default function App() {
     );
   }
 
+  async function handleRedeemCode() {
+    if (!identity || !redeemInput.trim()) return;
+    setRedeeming(true);
+    setMessage(null);
+    try {
+      const res = await fetch('/api/quota/redeem', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...buildIdentityHeaders(identity),
+        },
+        body: JSON.stringify({ code: redeemInput.trim() }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.error || '兑换失败');
+      }
+      setQuota(data.quota as QuotaSnapshot);
+      setRedeemInput('');
+      setShowRedeem(false);
+      setMessage({
+        type: 'success',
+        text: `兑换成功！已到账 ${data.addedPages} 页永久付费额度，已自动解锁 Pro 批量与高精模式。`,
+      });
+    } catch (err) {
+      setMessage({
+        type: 'error',
+        text: err instanceof Error ? err.message : '激活码兑换失败',
+      });
+    } finally {
+      setRedeeming(false);
+    }
+  }
+
   async function handleExtract() {
     if (!schema || activeCount === 0) return;
     setLoading(true);
@@ -176,8 +243,9 @@ export default function App() {
         }
       }
 
+      const effectivePdfPages = Math.min(maxPdfPages, maxPdfAllowed);
       const preparedFiles = await prepareFilesForExtraction(rawFiles, {
-        maxPages: maxPdfPages,
+        maxPages: effectivePdfPages,
         scale: 2.0,
         onProgress: (txt) => setProgressText(txt),
       });
@@ -193,11 +261,18 @@ export default function App() {
 
       const res = await fetch('/api/extract', {
         method: 'POST',
+        headers: buildIdentityHeaders(identity),
         body: formData,
       });
 
       const data = await res.json();
+      if (data.quota) {
+        setQuota(data.quota as QuotaSnapshot);
+      }
       if (!res.ok) {
+        if (res.status === 402 || res.status === 403 || res.status === 429) {
+          setShowRedeem(true);
+        }
         throw new Error(data.error || '提取失败');
       }
 
@@ -206,7 +281,7 @@ export default function App() {
       setRows(typed.rows);
       setMessage({
         type: 'info',
-        text: `已提取 ${typed.rows.length} 条记录（共处理 ${preparedFiles.length} 页/图，模式：${typed.mode === 'llm' ? typed.model : 'Mock 演示'}），请核对标黄单元格后写入表格。`,
+        text: `已提取 ${typed.rows.length} 条记录（消耗 ${typed.consumedPages} 页额度，剩余 ${typed.quota.totalAvailable} 页），请核对标黄单元格后写入表格。`,
       });
     } catch (err) {
       setMessage({
@@ -279,6 +354,63 @@ export default function App() {
         </span>
       </header>
 
+      {/* Quota Status Bar */}
+      {quota && (
+        <section className="quota-bar">
+          <div className="quota-info">
+            <span className={`tier-pill ${quota.tier === 'pro' ? 'tier-pro' : 'tier-free'}`}>
+              {quota.tier === 'pro' ? 'Pro 会员' : '免费版'}
+            </span>
+            <span>
+              可用额度 <strong>{quota.totalAvailable}</strong> 页
+            </span>
+            <small className="muted">
+              （今日免费 {quota.dailyRemaining}/{quota.dailyLimit}
+              {quota.welcomeRemaining > 0 ? ` · 新人赠送 ${quota.welcomeRemaining}` : ''}
+              {quota.paidRemaining > 0 ? ` · 付费永久 ${quota.paidRemaining}` : ''}）
+            </small>
+          </div>
+          <button
+            className="btn btn-ghost"
+            onClick={() => setShowRedeem((prev) => !prev)}
+          >
+            {showRedeem ? '收起兑换' : '兑换激活码'}
+          </button>
+        </section>
+      )}
+
+      {showRedeem && (
+        <section className="card redeem-card">
+          <div className="card-header">
+            <strong>兑换 Pro 额度激活码</strong>
+            <small className="muted">
+              Pro 解锁单次 20 页批量 + PDF 10 页/份 + 旗舰高精度模型
+            </small>
+          </div>
+          <div className="att-toolbar">
+            <input
+              className="hint-input"
+              style={{ flex: 1 }}
+              type="text"
+              placeholder={
+                serverMode === 'mock'
+                  ? '输入激活码（演示模式可试填 ATS-DEMO-100）'
+                  : '请输入激活码（例如 ATS-XXXX-XXXX）'
+              }
+              value={redeemInput}
+              onChange={(e) => setRedeemInput(e.target.value)}
+            />
+            <button
+              className="btn btn-primary"
+              disabled={redeeming || !redeemInput.trim()}
+              onClick={handleRedeemCode}
+            >
+              {redeeming ? '兑换中...' : '立即兑换'}
+            </button>
+          </div>
+        </section>
+      )}
+
       {/* Step 1: Target Table Schema */}
       <section className="card">
         <div className="card-header">
@@ -321,10 +453,13 @@ export default function App() {
         )}
       </section>
 
-      {/* Step 2: Input Source (Local Upload / PDF vs Feishu Attachment Column) */}
+      {/* Step 2: Input Source */}
       <section className="card">
         <div className="card-header">
-          <strong>2. 选择待识别文件</strong>
+          <strong>
+            2. 选择待识别文件{' '}
+            <small className="muted">（单次上限 {maxFilesAllowed} 份）</small>
+          </strong>
           <div className="tabs">
             <button
               className={`tab ${sourceTab === 'upload' ? 'tab-active' : ''}`}
@@ -361,7 +496,7 @@ export default function App() {
                 onChange={(e) => handleFileChange(e.target.files)}
               />
               <div>点击选择或拖入 图片 / 微信截图 / PDF（含扫描件）/ 文本</div>
-              <small>PDF 将在浏览器本地自动逐页转为高清图再识别，一份多明细单据自动拆多行</small>
+              <small>按实际提取页数计费（1 张图或 1 页 PDF = 1 页额度），失败不扣额度</small>
             </div>
 
             {files.length > 0 && (
@@ -457,12 +592,12 @@ export default function App() {
             PDF 上限
             <select
               className="select"
-              value={maxPdfPages}
+              value={Math.min(maxPdfPages, maxPdfAllowed)}
               onChange={(e) => setMaxPdfPages(Number(e.target.value))}
             >
               <option value={3}>3 页/份</option>
-              <option value={5}>5 页/份</option>
-              <option value={10}>10 页/份</option>
+              {maxPdfAllowed >= 5 && <option value={5}>5 页/份 (Pro)</option>}
+              {maxPdfAllowed >= 10 && <option value={10}>10 页/份 (Pro)</option>}
             </select>
           </label>
         </div>

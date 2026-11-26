@@ -77,11 +77,31 @@ export interface ExtractionRawItem {
   notes?: string;
 }
 
+export interface QuotaSnapshot {
+  userId: string;
+  tier: 'free' | 'pro';
+  dailyRemaining: number;
+  dailyLimit: number;
+  welcomeRemaining: number;
+  paidRemaining: number;
+  totalAvailable: number;
+  maxFilesPerRequest: number;
+  maxPdfPages: number;
+  globalFreeRemainingToday: number;
+}
+
+export interface UserIdentity {
+  userId: string;
+  tenantKey?: string;
+}
+
 export interface ExtractResponse {
   mode: 'llm' | 'mock';
   model: string;
   rows: ValidatedRow[];
   estimatedCostCny: number;
+  consumedPages: number;
+  quota: QuotaSnapshot;
   usage?: {
     promptTokens?: number;
     completionTokens?: number;
@@ -95,6 +115,7 @@ export interface ExtractResponse {
  */
 export interface HostAdapter {
   readonly hostName: string;
+  getUserIdentity?(): Promise<UserIdentity>;
   getActiveTableSchema(): Promise<TableSchema>;
   readAttachmentsFromField?(fieldId: string): Promise<HostAttachmentItem[]>;
   writeValidatedRows(schema: TableSchema, rows: ValidatedRow[]): Promise<{ writtenCount: number }>;

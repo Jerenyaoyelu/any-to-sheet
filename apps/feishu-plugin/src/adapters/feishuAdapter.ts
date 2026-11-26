@@ -14,6 +14,7 @@ import type {
   NormalizedFieldType,
   SelectOption,
   TableSchema,
+  UserIdentity,
   ValidatedRow,
 } from '@table-ai/core';
 
@@ -88,6 +89,33 @@ function toFeishuCellValue(field: FieldSchema, value: unknown): IOpenCellValue |
 
 export class FeishuHostAdapter implements HostAdapter {
   readonly hostName = '飞书多维表格';
+
+  async getUserIdentity(): Promise<UserIdentity> {
+    let userId = '';
+    let tenantKey: string | undefined;
+    try {
+      userId = await bitable.bridge.getBaseUserId();
+    } catch {
+      // fallback below
+    }
+    try {
+      tenantKey = await bitable.bridge.getTenantKey();
+    } catch {
+      // optional
+    }
+    if (!userId) {
+      const storageKey = 'any_to_sheet_feishu_fallback_uid';
+      let cached = window.localStorage.getItem(storageKey);
+      if (!cached) {
+        cached = `feishu_local_${Math.random().toString(36).slice(2, 10)}`;
+        window.localStorage.setItem(storageKey, cached);
+      }
+      userId = cached;
+    } else {
+      userId = `fs_${userId}`;
+    }
+    return { userId, tenantKey };
+  }
 
   async getActiveTableSchema(): Promise<TableSchema> {
     const table = await bitable.base.getActiveTable();
