@@ -45,7 +45,16 @@ const LLM_API_KEY = process.env.LLM_API_KEY?.trim() || '';
 const LLM_MODEL = process.env.LLM_MODEL || 'qwen-vl-max-latest';
 const LLM_FREE_MODEL = process.env.LLM_FREE_MODEL?.trim() || LLM_MODEL;
 const LLM_PRO_MODEL = process.env.LLM_PRO_MODEL?.trim() || LLM_MODEL;
-const ADMIN_TOKEN = process.env.ADMIN_TOKEN?.trim() || '';
+
+const RAW_ADMIN_TOKEN = process.env.ADMIN_TOKEN?.trim() || '';
+const IS_MOCK_MODE = !LLM_API_KEY;
+// In local mock mode only, allow a convenient default dev token when ADMIN_TOKEN is not yet configured
+const EFFECTIVE_ADMIN_TOKEN =
+  RAW_ADMIN_TOKEN && RAW_ADMIN_TOKEN !== 'change-me-in-production'
+    ? RAW_ADMIN_TOKEN
+    : IS_MOCK_MODE
+      ? 'dev-admin-123'
+      : '';
 
 const quotaStore = new QuotaStore(path.resolve(__dirname, '../data/quota-store.json'), {
   freeWelcomePages: Number(process.env.FREE_WELCOME_PAGES ?? 8),
@@ -56,13 +65,9 @@ const quotaStore = new QuotaStore(path.resolve(__dirname, '../data/quota-store.j
   proMaxFiles: 20,
   freeMaxPdfPages: 3,
   proMaxPdfPages: 10,
-  isMockMode: !LLM_API_KEY,
+  isMockMode: IS_MOCK_MODE,
 });
 
-/**
- * Safely resolves client IP without trusting raw spoofed X-Forwarded-For headers
- * unless TRUST_PROXY=true is explicitly enabled behind a trusted reverse proxy.
- */
 function getClientIp(req: express.Request): string {
   return req.ip || req.socket.remoteAddress || 'unknown';
 }
@@ -86,7 +91,26 @@ function safeTokenEquals(a: string, b: string): boolean {
   return crypto.timingSafeEqual(bufA, bufB);
 }
 
-/** Safely decode Multer latin1-encoded UTF-8 filenames without corrupting valid UTF-8 */
+function requireAdmin(
+  req: express.Request,
+  res: express.Response,
+  next: express.NextFunction
+): void {
+  const ipCheck = quotaStore.checkIpRateLimit(getClientIp(req), 'admin', 60);
+  if (!ipCheck.allowed) {
+    res.status(429).json({ error: `管理请求过于频繁，请 ${ipCheck.retryAfterSec} 秒后再试` });
+    return;
+  }
+
+  const rawToken = req.headers['x-admin-token'];
+  const token = typeof rawToken === 'string' ? rawToken.trim() : '';
+  if (!EFFECTIVE_ADMIN_TOKEN || !safeTokenEquals(token, EFFECTIVE_ADMIN_TOKEN)) {
+    res.status(401).json({ error: '管理员密钥无效或未配置 ADMIN_TOKEN' });
+    return;
+  }
+  next();
+}
+
 function decodeFileName(name: string): string {
   if (!/^[\u0000-\u00ff]*$/.test(name)) {
     return name;
@@ -135,10 +159,6 @@ function parseAndValidateSchema(raw: unknown): TableSchema | null {
   }
 }
 
-/**
- * Generates realistic schema-aware demo items when LLM_API_KEY is not yet configured.
- * Includes a deliberate low-confidence / math-check warning so users can test the yellow review UX.
- */
 function generateMockItems(schema: TableSchema, fileNames: string[]): ExtractionRawItem[] {
   const writableFields = schema.fields.filter((f) => !f.readonly && f.type !== 'unknown');
   const results: ExtractionRawItem[] = [];
@@ -343,7 +363,6 @@ async function fetchAttachmentSafely(initialUrl: string, maxBytes: number): Prom
   let currentUrl = initialUrl;
   let upstream: Response | null = null;
 
-  // Manually follow up to 3 redirects and re-validate every redirect target against the allowlist
   for (let hop = 0; hop < 4; hop++) {
     if (!isAllowedAttachmentUrl(currentUrl)) {
       throw new Error('目标附件重定向地址不在飞书安全白名单内');
@@ -369,7 +388,6 @@ async function fetchAttachmentSafely(initialUrl: string, maxBytes: number): Prom
   if (!upstream) {
     throw new Error('附件重定向次数过多');
   }
-
   if (!upstream.ok) {
     throw new Error(`拉取飞书附件失败 (${upstream.status})`);
   }
@@ -379,7 +397,6 @@ async function fetchAttachmentSafely(initialUrl: string, maxBytes: number): Prom
     throw new Error('单个附件超过 20MB 限制');
   }
 
-  // Stream with hard byte ceiling to prevent unbounded memory buffering DoS
   const reader = upstream.body?.getReader();
   if (!reader) {
     throw new Error('无法读取附件响应流');
@@ -406,6 +423,13 @@ async function fetchAttachmentSafely(initialUrl: string, maxBytes: number): Prom
   };
 }
 
+// ========== Lightweight Admin Dashboard UI ==========
+app.get('/admin', (_req, res) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.sendFile(path.resolve(__dirname, '../public/admin.html'));
+});
+
 app.get('/api/health', (_req, res) => {
   res.json({
     ok: true,
@@ -415,7 +439,6 @@ app.get('/api/health', (_req, res) => {
   });
 });
 
-/** Read-only quota query (never creates/writes user records on disk) */
 app.get('/api/quota', (req, res) => {
   const ipCheck = quotaStore.checkIpRateLimit(getClientIp(req), 'quota', 30);
   if (!ipCheck.allowed) {
@@ -431,7 +454,6 @@ app.get('/api/quota', (req, res) => {
   });
 });
 
-/** Redeem a Pro activation code to add permanent paid pages */
 app.post('/api/quota/redeem', (req, res) => {
   const ipCheck = quotaStore.checkIpRateLimit(getClientIp(req), 'redeem', 8);
   if (!ipCheck.allowed) {
@@ -440,8 +462,7 @@ app.post('/api/quota/redeem', (req, res) => {
   }
 
   const { userId, tenantKey } = getUserHeaders(req);
-  const code = req.body?.code;
-  const result = quotaStore.redeemCode(userId, code, tenantKey);
+  const result = quotaStore.redeemCode(userId, req.body?.code, tenantKey);
 
   if (!result.ok) {
     res.status(400).json({ error: result.error });
@@ -455,34 +476,71 @@ app.post('/api/quota/redeem', (req, res) => {
   });
 });
 
-/** Admin endpoint: batch-generate Pro redemption codes (requires x-admin-token header) */
-app.post('/api/admin/codes/generate', (req, res) => {
-  const rawToken = req.headers['x-admin-token'];
-  const token = typeof rawToken === 'string' ? rawToken : '';
-  if (
-    !ADMIN_TOKEN ||
-    ADMIN_TOKEN === 'change-me-in-production' ||
-    !safeTokenEquals(token, ADMIN_TOKEN)
-  ) {
-    res.status(401).json({ error: '未配置有效 ADMIN_TOKEN 或鉴权失败' });
-    return;
-  }
+// ========== Admin APIs (Protected by x-admin-token) ==========
+app.get('/api/admin/overview', requireAdmin, (_req, res) => {
+  res.json({
+    ok: true,
+    mode: LLM_API_KEY ? 'llm' : 'mock',
+    overview: quotaStore.getAdminOverview(),
+  });
+});
 
+app.get('/api/admin/users', requireAdmin, (_req, res) => {
+  res.json({ ok: true, users: quotaStore.listUsers() });
+});
+
+app.post('/api/admin/users/:userId/grant', requireAdmin, (req, res) => {
+  try {
+    const deltaPages = Number(req.body?.deltaPages);
+    if (!Number.isFinite(deltaPages) || deltaPages === 0) {
+      res.status(400).json({ error: 'deltaPages 必须为非零数字（正数赠送，负数扣减）' });
+      return;
+    }
+    const quota = quotaStore.adjustUserPaidPages(String(req.params.userId), deltaPages);
+    res.json({ ok: true, quota });
+  } catch (err) {
+    res.status(400).json({ error: err instanceof Error ? err.message : '调整失败' });
+  }
+});
+
+app.get('/api/admin/codes', requireAdmin, (_req, res) => {
+  res.json({ ok: true, codes: quotaStore.listCodes() });
+});
+
+app.post('/api/admin/codes/generate', requireAdmin, (req, res) => {
   const count = Number(req.body?.count ?? 10);
   const pages = Number(req.body?.pages ?? 100);
+  const priceCny = Number(req.body?.priceCny ?? 0);
   if (!Number.isFinite(count) || count < 1 || !Number.isFinite(pages) || pages < 1) {
     res.status(400).json({ error: 'count 和 pages 必须为大于 0 的数字' });
     return;
   }
+  if (!Number.isFinite(priceCny) || priceCny < 0) {
+    res.status(400).json({ error: 'priceCny 必须为大于等于 0 的数字' });
+    return;
+  }
 
-  const created = quotaStore.generateCodes(count, pages, req.body?.note);
+  const created = quotaStore.generateCodes(count, pages, {
+    priceCny,
+    channel: req.body?.channel,
+    note: req.body?.note,
+  });
   res.json({ ok: true, count: created.length, codes: created });
 });
 
-/**
- * Safely proxies Feishu temporary attachment URLs with redirect allowlist re-validation
- * and streaming 20MB cap.
- */
+app.post('/api/admin/codes/:code/revoke', requireAdmin, (req, res) => {
+  const result = quotaStore.revokeCode(String(req.params.code));
+  if (!result.ok) {
+    res.status(400).json({ error: result.error });
+    return;
+  }
+  res.json({ ok: true, record: result.record });
+});
+
+app.get('/api/admin/logs', requireAdmin, (_req, res) => {
+  res.json({ ok: true, logs: quotaStore.listLogs() });
+});
+
 app.post('/api/fetch-attachment', async (req, res) => {
   const ipCheck = quotaStore.checkIpRateLimit(getClientIp(req), 'fetch_att', 20);
   if (!ipCheck.allowed) {
@@ -511,6 +569,11 @@ app.post('/api/fetch-attachment', async (req, res) => {
 
 app.post('/api/extract', upload.array('files', 25), async (req, res) => {
   let reservationId: string | null = null;
+  let reservedUserId = '';
+  let reservedTier: 'free' | 'pro' = 'free';
+  let chosenModel = LLM_FREE_MODEL;
+  let pageCost = 0;
+
   try {
     const clientIp = getClientIp(req);
     const ipCheck = quotaStore.checkIpRateLimit(clientIp, 'extract', 10);
@@ -532,9 +595,8 @@ app.post('/api/extract', upload.array('files', 25), async (req, res) => {
     }
 
     const { userId, tenantKey } = getUserHeaders(req);
-    const pageCost = files.length;
+    pageCost = files.length;
 
-    // Atomic reservation prevents concurrent TOCTOU quota bypass
     const reserveRes = quotaStore.reserve(userId, pageCost, tenantKey, clientIp);
     if (!reserveRes.allowed) {
       res.status(reserveRes.statusCode).json({
@@ -545,10 +607,12 @@ app.post('/api/extract', upload.array('files', 25), async (req, res) => {
     }
 
     reservationId = reserveRes.reservation.id;
+    reservedUserId = reserveRes.reservation.userId;
+    reservedTier = reserveRes.reservation.plan.useProModel ? 'pro' : 'free';
+    chosenModel = reserveRes.reservation.plan.useProModel ? LLM_PRO_MODEL : LLM_FREE_MODEL;
 
     const userHint = typeof req.body?.userHint === 'string' ? req.body.userHint : undefined;
     const fileNames = files.map((f) => decodeFileName(f.originalname));
-    const chosenModel = reserveRes.reservation.plan.useProModel ? LLM_PRO_MODEL : LLM_FREE_MODEL;
 
     let items: ExtractionRawItem[];
     let mode: 'llm' | 'mock' = 'mock';
@@ -567,7 +631,6 @@ app.post('/api/extract', upload.array('files', 25), async (req, res) => {
 
     const validatedRows = validateExtractionItems(schema, items);
 
-    // Commit reservation ONLY after extraction succeeds
     const updatedQuota = quotaStore.commit(reservationId);
     reservationId = null;
 
@@ -575,6 +638,17 @@ app.post('/api/extract', upload.array('files', 25), async (req, res) => {
       mode === 'llm'
         ? Number(((promptTokens / 1000) * 0.003 + (completionTokens / 1000) * 0.009).toFixed(4))
         : 0;
+
+    quotaStore.recordLog({
+      userId: reservedUserId,
+      tier: reservedTier,
+      mode,
+      model: mode === 'llm' ? chosenModel : 'mock-demo',
+      pages: pageCost,
+      rowsExtracted: validatedRows.length,
+      estimatedCostCny,
+      status: 'ok',
+    });
 
     const payload: ExtractResponse = {
       mode,
@@ -590,6 +664,17 @@ app.post('/api/extract', upload.array('files', 25), async (req, res) => {
   } catch (err) {
     if (reservationId) {
       quotaStore.release(reservationId);
+      quotaStore.recordLog({
+        userId: reservedUserId || 'unknown',
+        tier: reservedTier,
+        mode: LLM_API_KEY ? 'llm' : 'mock',
+        model: LLM_API_KEY ? chosenModel : 'mock-demo',
+        pages: pageCost,
+        rowsExtracted: 0,
+        estimatedCostCny: 0,
+        status: 'error',
+        error: err instanceof Error ? err.message.slice(0, 180) : '未知提取错误',
+      });
     }
     const message = err instanceof Error ? err.message : '未知提取错误';
     console.error('[extract error]', err);
@@ -597,7 +682,6 @@ app.post('/api/extract', upload.array('files', 25), async (req, res) => {
   }
 });
 
-/** Global JSON error handler: prevents MulterError or bad JSON from leaking HTML stack traces */
 app.use(
   (
     err: unknown,
@@ -629,8 +713,9 @@ app.use(
 
 app.listen(PORT, () => {
   console.log(`[any-to-sheet-server] running at http://localhost:${PORT}`);
+  console.log(`[any-to-sheet-server] admin console: http://localhost:${PORT}/admin`);
   console.log(
-    `[any-to-sheet-server] mode: ${LLM_API_KEY ? `LLM (free=${LLM_FREE_MODEL}, pro=${LLM_PRO_MODEL})` : 'MOCK DEMO (在 apps/server/.env 中配置 LLM_API_KEY 后切换为真实模型)'}`
+    `[any-to-sheet-server] mode: ${LLM_API_KEY ? `LLM (free=${LLM_FREE_MODEL}, pro=${LLM_PRO_MODEL})` : 'MOCK DEMO (默认开发后台密钥: dev-admin-123)'}`
   );
   console.log(
     `[any-to-sheet-server] quota policy: welcome=${process.env.FREE_WELCOME_PAGES ?? 8} + daily=${process.env.FREE_DAILY_PAGES ?? 2} pages/day, ipDailyCap=${process.env.IP_DAILY_FREE_LIMIT ?? 30}, globalDailyFreeCap=${process.env.GLOBAL_DAILY_FREE_LIMIT ?? 1000}, trustProxy=${TRUST_PROXY}`

@@ -21,7 +21,7 @@ export interface QuotaConfig {
   isMockMode: boolean;
 }
 
-interface UserQuotaRecord {
+export interface UserQuotaRecord {
   userId: string;
   tenantKey?: string;
   welcomeRemaining: number;
@@ -33,18 +33,37 @@ interface UserQuotaRecord {
   lastActiveAt: string;
 }
 
-interface RedeemCodeRecord {
+export interface RedeemCodeRecord {
   code: string;
   pages: number;
+  priceCny: number;
+  channel?: string;
   note?: string;
   createdAt: string;
   redeemedBy?: string;
   redeemedAt?: string;
+  revoked?: boolean;
+  revokedAt?: string;
+}
+
+export interface ExtractionLogRecord {
+  id: string;
+  createdAt: string;
+  userId: string;
+  tier: 'free' | 'pro';
+  mode: 'llm' | 'mock';
+  model: string;
+  pages: number;
+  rowsExtracted: number;
+  estimatedCostCny: number;
+  status: 'ok' | 'error';
+  error?: string;
 }
 
 interface PersistedStore {
   users: Record<string, UserQuotaRecord>;
   codes: Record<string, RedeemCodeRecord>;
+  logs: ExtractionLogRecord[];
   globalDailyFree: {
     date: string;
     usedPages: number;
@@ -73,6 +92,8 @@ export interface QuotaReservation {
   createdAt: number;
 }
 
+const MAX_STORED_LOGS = 200;
+
 const FORBIDDEN_KEYS = new Set([
   '__proto__',
   'constructor',
@@ -91,7 +112,6 @@ function sanitizeKey(raw: string, fallback = 'anonymous'): string {
 }
 
 function getTodayStr(): string {
-  // Use Asia/Shanghai date string (YYYY-MM-DD) for Chinese users
   const now = new Date(Date.now() + 8 * 60 * 60 * 1000);
   return now.toISOString().slice(0, 10);
 }
@@ -114,6 +134,7 @@ export class QuotaStore {
     const empty: PersistedStore = {
       users: Object.create(null) as Record<string, UserQuotaRecord>,
       codes: Object.create(null) as Record<string, RedeemCodeRecord>,
+      logs: [],
       globalDailyFree: { date: today, usedPages: 0 },
       ipDailyFree: { date: today, byIp: Object.create(null) as Record<string, number> },
     };
@@ -135,7 +156,12 @@ export class QuotaStore {
       const codes = Object.create(null) as Record<string, RedeemCodeRecord>;
       if (parsed.codes && typeof parsed.codes === 'object') {
         for (const [k, v] of Object.entries(parsed.codes)) {
-          if (!FORBIDDEN_KEYS.has(k)) codes[k] = v;
+          if (!FORBIDDEN_KEYS.has(k)) {
+            codes[k] = {
+              ...v,
+              priceCny: typeof v.priceCny === 'number' ? v.priceCny : 0,
+            };
+          }
         }
       }
 
@@ -149,6 +175,7 @@ export class QuotaStore {
       return {
         users,
         codes,
+        logs: Array.isArray(parsed.logs) ? parsed.logs.slice(0, MAX_STORED_LOGS) : [],
         globalDailyFree: parsed.globalDailyFree || { date: today, usedPages: 0 },
         ipDailyFree: {
           date: parsed.ipDailyFree?.date || today,
@@ -187,7 +214,6 @@ export class QuotaStore {
         byIp: Object.create(null) as Record<string, number>,
       };
     }
-    // Evict stale reservations older than 5 minutes (defensive guard)
     const now = Date.now();
     for (const [id, r] of this.pendingReservations.entries()) {
       if (now - r.createdAt > 5 * 60 * 1000) {
@@ -210,7 +236,6 @@ export class QuotaStore {
       return existing;
     }
 
-    // Read-only virtual record (NOT persisted until actual consumption or valid redemption)
     return {
       userId: cleanId,
       tenantKey,
@@ -274,7 +299,6 @@ export class QuotaStore {
     const windowMs = 60 * 1000;
     const key = `${bucketPrefix}:${sanitizeKey(ip, 'ip')}`;
 
-    // Periodic cleanup when map grows
     if (this.ipBuckets.size > 500) {
       for (const [k, list] of this.ipBuckets.entries()) {
         const fresh = list.filter((ts) => now - ts < windowMs);
@@ -325,14 +349,6 @@ export class QuotaStore {
     };
   }
 
-  /**
-   * Atomically reserves pages before invoking LLM (eliminates TOCTOU concurrent bypass).
-   * Deduction rules are unified between check & commit:
-   * - Pro users (paidRemaining > 0) consume paid pages FIRST (routed to LLM_PRO_MODEL,
-   *   never eating into shared office IP or global free circuit breakers, and preventing
-   *   the "1 paid page = permanent free Pro" exploit).
-   * - Free users consume daily -> welcome (subject to per-IP & global daily free caps).
-   */
   reserve(
     userId: string,
     pageCount: number,
@@ -370,7 +386,6 @@ export class QuotaStore {
       };
     }
 
-    // Unified deduction plan: paid first (when Pro) -> daily -> welcome
     let left = pageCount;
     const usePaid = Math.min(left, snapshot.paidRemaining);
     left -= usePaid;
@@ -434,7 +449,6 @@ export class QuotaStore {
     };
   }
 
-  /** Commits a reservation after LLM extraction succeeds */
   commit(reservationId: string): QuotaSnapshot {
     const r = this.pendingReservations.get(reservationId);
     if (!r) {
@@ -464,19 +478,39 @@ export class QuotaStore {
     return this.getSnapshot(r.userId, r.tenantKey);
   }
 
-  /** Releases a reservation if extraction fails (failed calls never burn credits) */
   release(reservationId: string): void {
     this.pendingReservations.delete(reservationId);
   }
 
-  generateCodes(count: number, pages: number, note?: string): RedeemCodeRecord[] {
+  recordLog(entry: Omit<ExtractionLogRecord, 'id' | 'createdAt'>): void {
+    const log: ExtractionLogRecord = {
+      id: crypto.randomUUID().slice(0, 12),
+      createdAt: new Date().toISOString(),
+      ...entry,
+    };
+    this.data.logs.unshift(log);
+    if (this.data.logs.length > MAX_STORED_LOGS) {
+      this.data.logs.length = MAX_STORED_LOGS;
+    }
+    this.save();
+  }
+
+  generateCodes(
+    count: number,
+    pages: number,
+    options: { priceCny?: number; channel?: string; note?: string } = {}
+  ): RedeemCodeRecord[] {
     if (!Number.isFinite(count) || !Number.isFinite(pages)) {
       throw new Error('count 和 pages 必须为有效数字');
     }
     const safeCount = Math.min(Math.max(1, Math.floor(count)), 200);
     const safePages = Math.min(Math.max(1, Math.floor(pages)), 100000);
-    const created: RedeemCodeRecord[] = [];
+    const safePrice =
+      typeof options.priceCny === 'number' && Number.isFinite(options.priceCny) && options.priceCny >= 0
+        ? Number(options.priceCny.toFixed(2))
+        : 0;
 
+    const created: RedeemCodeRecord[] = [];
     for (let i = 0; i < safeCount; i++) {
       const part1 = crypto.randomBytes(2).toString('hex').toUpperCase();
       const part2 = crypto.randomBytes(2).toString('hex').toUpperCase();
@@ -484,7 +518,9 @@ export class QuotaStore {
       const record: RedeemCodeRecord = {
         code,
         pages: safePages,
-        note: typeof note === 'string' ? note.slice(0, 100) : undefined,
+        priceCny: safePrice,
+        channel: typeof options.channel === 'string' ? options.channel.trim().slice(0, 40) : undefined,
+        note: typeof options.note === 'string' ? options.note.trim().slice(0, 100) : undefined,
         createdAt: new Date().toISOString(),
       };
       this.data.codes[code] = record;
@@ -492,6 +528,24 @@ export class QuotaStore {
     }
     this.save();
     return created;
+  }
+
+  revokeCode(rawCode: string): { ok: true; record: RedeemCodeRecord } | { ok: false; error: string } {
+    const code = rawCode.trim().toUpperCase();
+    if (FORBIDDEN_KEYS.has(code) || !Object.hasOwn(this.data.codes, code)) {
+      return { ok: false, error: '激活码不存在' };
+    }
+    const record = this.data.codes[code];
+    if (record.redeemedBy) {
+      return { ok: false, error: '该激活码已被兑换，无法作废' };
+    }
+    if (record.revoked) {
+      return { ok: false, error: '该激活码已处于作废状态' };
+    }
+    record.revoked = true;
+    record.revokedAt = new Date().toISOString();
+    this.save();
+    return { ok: true, record };
   }
 
   redeemCode(
@@ -505,7 +559,6 @@ export class QuotaStore {
     const code = rawCode.trim().toUpperCase();
     const cleanId = sanitizeKey(userId);
 
-    // Built-in demo code for local testing ONLY when LLM_API_KEY is not configured
     if (this.config.isMockMode && code === 'ATS-DEMO-100') {
       const user = this.ensurePersistedUser(cleanId, tenantKey);
       user.paidRemaining += 100;
@@ -519,6 +572,9 @@ export class QuotaStore {
     }
 
     const record = this.data.codes[code];
+    if (record.revoked) {
+      return { ok: false, error: '该激活码已作废，无法使用' };
+    }
     if (record.redeemedBy) {
       return { ok: false, error: '该激活码已被使用，无法重复兑换' };
     }
@@ -535,5 +591,116 @@ export class QuotaStore {
       addedPages: record.pages,
       snapshot: this.getSnapshot(cleanId, tenantKey),
     };
+  }
+
+  /** Admin helper: manually grant or deduct paid pages for customer support / VIP users */
+  adjustUserPaidPages(userId: string, deltaPages: number): QuotaSnapshot {
+    if (!Number.isFinite(deltaPages) || deltaPages === 0) {
+      throw new Error('调整页数必须为非零数字');
+    }
+    const user = this.ensurePersistedUser(userId);
+    user.paidRemaining = Math.max(0, user.paidRemaining + Math.trunc(deltaPages));
+    user.lastActiveAt = new Date().toISOString();
+    this.save();
+    return this.getSnapshot(user.userId, user.tenantKey);
+  }
+
+  getAdminOverview() {
+    this.syncGlobalDates();
+    const today = getTodayStr();
+    const allUsers = Object.values(this.data.users);
+    const allCodes = Object.values(this.data.codes);
+
+    let activeUsersToday = 0;
+    let proUsers = 0;
+    let totalPagesProcessed = 0;
+
+    for (const u of allUsers) {
+      totalPagesProcessed += u.totalUsedPages || 0;
+      if (u.paidRemaining > 0) proUsers++;
+      const lastDay = u.lastActiveAt
+        ? new Date(Date.parse(u.lastActiveAt) + 8 * 60 * 60 * 1000).toISOString().slice(0, 10)
+        : '';
+      if (lastDay === today) activeUsersToday++;
+    }
+
+    let codesUnused = 0;
+    let codesRedeemed = 0;
+    let codesRevoked = 0;
+    let redeemedRevenueCny = 0;
+    let issuedValueCny = 0;
+
+    for (const c of allCodes) {
+      const price = typeof c.priceCny === 'number' ? c.priceCny : 0;
+      if (c.revoked) {
+        codesRevoked++;
+      } else if (c.redeemedBy) {
+        codesRedeemed++;
+        redeemedRevenueCny += price;
+        issuedValueCny += price;
+      } else {
+        codesUnused++;
+        issuedValueCny += price;
+      }
+    }
+
+    let estimatedApiCostCny = 0;
+    for (const l of this.data.logs) {
+      estimatedApiCostCny += l.estimatedCostCny || 0;
+    }
+
+    redeemedRevenueCny = Number(redeemedRevenueCny.toFixed(2));
+    issuedValueCny = Number(issuedValueCny.toFixed(2));
+    estimatedApiCostCny = Number(estimatedApiCostCny.toFixed(4));
+
+    return {
+      today,
+      totalUsers: allUsers.length,
+      activeUsersToday,
+      proUsers,
+      totalPagesProcessed,
+      globalFreeUsedToday: this.data.globalDailyFree.usedPages,
+      globalFreeLimitToday: this.config.globalDailyFreeLimit,
+      codesTotal: allCodes.length,
+      codesUnused,
+      codesRedeemed,
+      codesRevoked,
+      redeemedRevenueCny,
+      issuedValueCny,
+      estimatedApiCostCny,
+      grossProfitCny: Number((redeemedRevenueCny - estimatedApiCostCny).toFixed(2)),
+    };
+  }
+
+  listUsers() {
+    this.syncGlobalDates();
+    const today = getTodayStr();
+    return Object.values(this.data.users)
+      .map((u) => {
+        const dailyUsed = u.dailyDate === today ? u.dailyUsed : 0;
+        const dailyRemaining = Math.max(0, this.config.freeDailyPages - dailyUsed);
+        const totalAvailable = dailyRemaining + u.welcomeRemaining + u.paidRemaining;
+        return {
+          userId: u.userId,
+          tenantKey: u.tenantKey || '',
+          tier: u.paidRemaining > 0 ? 'pro' : 'free',
+          dailyRemaining,
+          welcomeRemaining: u.welcomeRemaining,
+          paidRemaining: u.paidRemaining,
+          totalAvailable,
+          totalUsedPages: u.totalUsedPages,
+          createdAt: u.createdAt,
+          lastActiveAt: u.lastActiveAt,
+        };
+      })
+      .sort((a, b) => b.lastActiveAt.localeCompare(a.lastActiveAt));
+  }
+
+  listCodes() {
+    return Object.values(this.data.codes).sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  }
+
+  listLogs() {
+    return this.data.logs;
   }
 }

@@ -1,0 +1,699 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>AnyToSheet 后台管理台</title>
+    <style>
+      :root {
+        --bg: #f5f6f8;
+        --card: #ffffff;
+        --border: #e5e6eb;
+        --text: #1f2329;
+        --muted: #646a73;
+        --primary: #3370ff;
+        --primary-hover: #245bdb;
+        --success: #00b42a;
+        --warn: #ff7d00;
+        --danger: #f54a45;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif;
+        background: var(--bg);
+        color: var(--text);
+        font-size: 13px;
+      }
+      .login-wrap {
+        min-height: 100vh;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        padding: 16px;
+      }
+      .login-card {
+        width: 100%;
+        max-width: 380px;
+        background: var(--card);
+        border: 1px solid var(--border);
+        border-radius: 12px;
+        padding: 24px;
+        display: flex;
+        flex-direction: column;
+        gap: 14px;
+        box-shadow: 0 4px 16px rgba(0, 0, 0, 0.04);
+      }
+      .login-card h1 { margin: 0; font-size: 20px; }
+      .wrap {
+        max-width: 1180px;
+        margin: 0 auto;
+        padding: 20px;
+        display: flex;
+        flex-direction: column;
+        gap: 16px;
+      }
+      .topbar {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        flex-wrap: wrap;
+        gap: 12px;
+      }
+      .topbar h1 { margin: 0; font-size: 20px; }
+      .muted { color: var(--muted); font-size: 12px; }
+      .kpi-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+        gap: 12px;
+      }
+      .kpi {
+        background: var(--card);
+        border: 1px solid var(--border);
+        border-radius: 10px;
+        padding: 14px 16px;
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+      }
+      .kpi-label { color: var(--muted); font-size: 12px; }
+      .kpi-val { font-size: 24px; font-weight: 700; }
+      .kpi-sub { font-size: 12px; color: var(--muted); }
+      .progress-track {
+        height: 6px;
+        background: #f2f3f5;
+        border-radius: 999px;
+        overflow: hidden;
+        margin-top: 2px;
+      }
+      .progress-fill {
+        height: 100%;
+        background: var(--primary);
+        transition: width 0.25s;
+      }
+      .card {
+        background: var(--card);
+        border: 1px solid var(--border);
+        border-radius: 10px;
+        padding: 16px;
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+      }
+      .tabs {
+        display: inline-flex;
+        gap: 4px;
+        background: #e9ecf2;
+        padding: 3px;
+        border-radius: 8px;
+        align-self: flex-start;
+      }
+      .tab {
+        border: none;
+        background: transparent;
+        padding: 7px 14px;
+        border-radius: 6px;
+        font-size: 13px;
+        cursor: pointer;
+        color: var(--muted);
+        font-weight: 500;
+      }
+      .tab.active {
+        background: #fff;
+        color: var(--primary);
+        font-weight: 600;
+        box-shadow: 0 1px 2px rgba(0, 0, 0, 0.06);
+      }
+      .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+      .input, .select {
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        padding: 7px 10px;
+        font-size: 13px;
+        outline: none;
+        background: #fff;
+      }
+      .input:focus, .select:focus { border-color: var(--primary); }
+      .btn {
+        border: none;
+        border-radius: 6px;
+        padding: 7px 13px;
+        font-size: 13px;
+        font-weight: 500;
+        cursor: pointer;
+        white-space: nowrap;
+      }
+      .btn-primary { background: var(--primary); color: #fff; }
+      .btn-primary:hover { background: var(--primary-hover); }
+      .btn-ghost { background: #f2f3f5; color: var(--text); }
+      .btn-danger { background: #ffece8; color: var(--danger); }
+      .btn-sm { padding: 4px 8px; font-size: 12px; }
+      .presets { display: flex; gap: 6px; flex-wrap: wrap; }
+      .preset {
+        background: #eef3ff;
+        color: var(--primary);
+        border: 1px solid #d0e0ff;
+        border-radius: 6px;
+        padding: 4px 10px;
+        font-size: 12px;
+        cursor: pointer;
+      }
+      .preset:hover { background: #dfeaff; }
+      .table-wrap { overflow-x: auto; border: 1px solid var(--border); border-radius: 8px; }
+      table { width: 100%; border-collapse: collapse; font-size: 12px; }
+      th, td {
+        padding: 8px 10px;
+        border-bottom: 1px solid var(--border);
+        text-align: left;
+        white-space: nowrap;
+      }
+      th { background: #f7f8fa; font-weight: 600; color: #4e5969; }
+      .pill {
+        display: inline-block;
+        padding: 2px 7px;
+        border-radius: 999px;
+        font-size: 11px;
+        font-weight: 600;
+      }
+      .pill-green { background: #e8ffea; color: #009a29; }
+      .pill-blue { background: #eef3ff; color: var(--primary); }
+      .pill-orange { background: #fff3e0; color: #d96b00; }
+      .pill-gray { background: #f2f3f5; color: #646a73; }
+      .pill-red { background: #ffece8; color: var(--danger); }
+      .code-box {
+        background: #f7faff;
+        border: 1px solid #bcd4ff;
+        border-radius: 8px;
+        padding: 10px 12px;
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+      }
+      .code-list {
+        font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+        font-size: 12px;
+        background: #fff;
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        padding: 8px;
+        max-height: 150px;
+        overflow-y: auto;
+        white-space: pre-wrap;
+      }
+      .toast {
+        padding: 8px 12px;
+        border-radius: 8px;
+        font-size: 12px;
+      }
+      .toast-ok { background: #e8ffea; color: #008026; }
+      .toast-err { background: #ffece8; color: #cb2634; }
+      .hidden { display: none !important; }
+    </style>
+  </head>
+  <body>
+    <!-- Login View -->
+    <div id="loginView" class="login-wrap">
+      <div class="login-card">
+        <div>
+          <h1>AnyToSheet 后台管理台</h1>
+          <p class="muted" style="margin:6px 0 0;">经营数据 · 激活码发卡 · 用户额度 · API 成本监控</p>
+        </div>
+        <input id="tokenInput" class="input" type="password" placeholder="请输入 ADMIN_TOKEN（本地 Mock 默认：dev-admin-123）" />
+        <button id="loginBtn" class="btn btn-primary">进入管理台</button>
+        <div id="loginErr" class="toast toast-err hidden"></div>
+      </div>
+    </div>
+
+    <!-- Main Dashboard -->
+    <div id="appView" class="wrap hidden">
+      <div class="topbar">
+        <div>
+          <h1>AnyToSheet 运营管理台</h1>
+          <span id="modeInfo" class="muted">加载中...</span>
+        </div>
+        <div class="row">
+          <button id="refreshBtn" class="btn btn-ghost">刷新数据</button>
+          <button id="logoutBtn" class="btn btn-danger">退出登录</button>
+        </div>
+      </div>
+
+      <div id="globalToast" class="toast hidden"></div>
+
+      <!-- KPI Cards -->
+      <div class="kpi-grid">
+        <div class="kpi">
+          <span class="kpi-label">已兑换收入 / 预估 API 成本</span>
+          <span class="kpi-val" id="kpiRevenue">¥0.00</span>
+          <span class="kpi-sub" id="kpiCost">估算成本 ¥0.00 · 估算毛利 ¥0.00</span>
+        </div>
+        <div class="kpi">
+          <span class="kpi-label">用户总数 / 今日活跃</span>
+          <span class="kpi-val" id="kpiUsers">0</span>
+          <span class="kpi-sub" id="kpiUsersSub">今日活跃 0 · Pro 付费用户 0</span>
+        </div>
+        <div class="kpi">
+          <span class="kpi-label">今日免费通道熔断水位</span>
+          <span class="kpi-val" id="kpiFree">0 / 1000</span>
+          <div class="progress-track"><div id="freeBar" class="progress-fill" style="width:0%"></div></div>
+          <span class="kpi-sub" id="kpiTotalPages">累计处理 0 页</span>
+        </div>
+        <div class="kpi">
+          <span class="kpi-label">激活码库存（可用 / 已兑）</span>
+          <span class="kpi-val" id="kpiCodes">0 / 0</span>
+          <span class="kpi-sub" id="kpiCodesSub">累计发卡面额 ¥0.00</span>
+        </div>
+      </div>
+
+      <!-- Navigation Tabs -->
+      <div class="tabs">
+        <button class="tab active" data-tab="codes">激活码发卡中心</button>
+        <button class="tab" data-tab="users">用户与额度管理</button>
+        <button class="tab" data-tab="logs">最近调用流水</button>
+      </div>
+
+      <!-- Tab 1: Codes -->
+      <div id="tab-codes" class="card">
+        <div class="row" style="justify-content: space-between;">
+          <strong>批量生成 Pro 激活码</strong>
+          <div class="presets">
+            <button class="preset" data-pages="100" data-price="9.9" data-note="体验包100页">¥9.9 / 100页</button>
+            <button class="preset" data-pages="300" data-price="19.9" data-note="月卡300页">¥19.9 / 300页</button>
+            <button class="preset" data-pages="1000" data-price="49.9" data-note="团队包1000页">¥49.9 / 1000页</button>
+            <button class="preset" data-pages="20" data-price="0" data-note="种子用户赠送">¥0 / 20页赠送</button>
+          </div>
+        </div>
+        <div class="row">
+          <label>数量 <input id="genCount" class="input" type="number" min="1" max="200" value="5" style="width:76px" /></label>
+          <label>面额(页) <input id="genPages" class="input" type="number" min="1" value="100" style="width:92px" /></label>
+          <label>售价(¥) <input id="genPrice" class="input" type="number" min="0" step="0.1" value="9.9" style="width:88px" /></label>
+          <select id="genChannel" class="select">
+            <option value="小红书">渠道：小红书</option>
+            <option value="微信私域">渠道：微信私域</option>
+            <option value="闲鱼/发卡">渠道：闲鱼/发卡</option>
+            <option value="B站/抖音">渠道：B站/抖音</option>
+            <option value="内部赠送">渠道：内部赠送</option>
+          </select>
+          <input id="genNote" class="input" placeholder="备注（如：体验包）" style="flex:1;min-width:140px" />
+          <button id="genBtn" class="btn btn-primary">一键生成</button>
+        </div>
+
+        <div id="freshCodesBox" class="code-box hidden">
+          <div class="row" style="justify-content: space-between;">
+            <strong>本次新生成的激活码：</strong>
+            <button id="copyFreshBtn" class="btn btn-primary btn-sm">一键复制全部</button>
+          </div>
+          <div id="freshCodesList" class="code-list"></div>
+        </div>
+
+        <div class="row" style="justify-content: space-between; margin-top: 6px;">
+          <strong>全部激活码记录</strong>
+          <select id="codeFilter" class="select">
+            <option value="all">全部状态</option>
+            <option value="unused">仅看未使用</option>
+            <option value="redeemed">仅看已兑换</option>
+            <option value="revoked">仅看已作废</option>
+          </select>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>激活码</th>
+                <th>页数</th>
+                <th>售价</th>
+                <th>渠道 / 备注</th>
+                <th>状态</th>
+                <th>兑换用户 / 时间</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody id="codesTbody"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- Tab 2: Users -->
+      <div id="tab-users" class="card hidden">
+        <div class="row" style="justify-content: space-between;">
+          <strong>全部用户列表（按最近活跃排序）</strong>
+          <input id="userSearch" class="input" placeholder="搜索 userId 或 tenantKey..." style="width:240px" />
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>用户 ID</th>
+                <th>等级</th>
+                <th>可用总页</th>
+                <th>今日免费</th>
+                <th>新人剩余</th>
+                <th>付费永久</th>
+                <th>累计已用</th>
+                <th>最近活跃</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody id="usersTbody"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- Tab 3: Logs -->
+      <div id="tab-logs" class="card hidden">
+        <strong>最近提取流水（最新 200 条）</strong>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>时间</th>
+                <th>用户 ID</th>
+                <th>套餐</th>
+                <th>模型</th>
+                <th>页数</th>
+                <th>提取行数</th>
+                <th>预估成本</th>
+                <th>状态</th>
+              </tr>
+            </thead>
+            <tbody id="logsTbody"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <script>
+      const TOKEN_KEY = 'any_to_sheet_admin_token';
+      let adminToken = sessionStorage.getItem(TOKEN_KEY) || '';
+      let cachedCodes = [];
+      let cachedUsers = [];
+      let freshGenerated = [];
+
+      function esc(str) {
+        return String(str ?? '')
+          .replace(/&/g, '&amp;')
+          .replace(/</g, '&lt;')
+          .replace(/>/g, '&gt;')
+          .replace(/"/g, '&quot;');
+      }
+
+      function fmtTime(iso) {
+        if (!iso) return '-';
+        try {
+          return new Date(iso).toLocaleString('zh-CN', { hour12: false });
+        } catch {
+          return iso;
+        }
+      }
+
+      function showToast(text, isErr = false) {
+        const el = document.getElementById('globalToast');
+        el.textContent = text;
+        el.className = 'toast ' + (isErr ? 'toast-err' : 'toast-ok');
+        clearTimeout(el._timer);
+        el._timer = setTimeout(() => el.classList.add('hidden'), 4000);
+      }
+
+      async function api(url, opts = {}) {
+        const res = await fetch(url, {
+          ...opts,
+          headers: {
+            'Content-Type': 'application/json',
+            'x-admin-token': adminToken,
+            ...(opts.headers || {}),
+          },
+        });
+        const data = await res.json().catch(() => ({ error: '响应解析失败' }));
+        if (!res.ok) throw new Error(data.error || '请求失败 (' + res.status + ')');
+        return data;
+      }
+
+      async function loadAll() {
+        const [ov, us, cs, lg] = await Promise.all([
+          api('/api/admin/overview'),
+          api('/api/admin/users'),
+          api('/api/admin/codes'),
+          api('/api/admin/logs'),
+        ]);
+
+        const o = ov.overview;
+        document.getElementById('modeInfo').textContent =
+          '运行模式：' + (ov.mode === 'llm' ? '真实大模型 (LLM)' : '本地演示 (MOCK)') + ' · 统计日期：' + o.today;
+
+        document.getElementById('kpiRevenue').textContent = '¥' + o.redeemedRevenueCny.toFixed(2);
+        document.getElementById('kpiCost').textContent =
+          '估算成本 ¥' + o.estimatedApiCostCny.toFixed(4) + ' · 估算毛利 ¥' + o.grossProfitCny.toFixed(2);
+
+        document.getElementById('kpiUsers').textContent = o.totalUsers + ' / ' + o.activeUsersToday;
+        document.getElementById('kpiUsersSub').textContent =
+          '今日活跃 ' + o.activeUsersToday + ' 人 · Pro 付费用户 ' + o.proUsers + ' 人';
+
+        document.getElementById('kpiFree').textContent = o.globalFreeUsedToday + ' / ' + o.globalFreeLimitToday;
+        const pct = Math.min(100, Math.round((o.globalFreeUsedToday / Math.max(1, o.globalFreeLimitToday)) * 100));
+        document.getElementById('freeBar').style.width = pct + '%';
+        document.getElementById('kpiTotalPages').textContent = '累计处理 ' + o.totalPagesProcessed + ' 页';
+
+        document.getElementById('kpiCodes').textContent = o.codesUnused + ' / ' + o.codesRedeemed;
+        document.getElementById('kpiCodesSub').textContent =
+          '累计有效面额 ¥' + o.issuedValueCny.toFixed(2) + ' · 已作废 ' + o.codesRevoked + ' 个';
+
+        cachedUsers = us.users || [];
+        cachedCodes = cs.codes || [];
+        renderCodes();
+        renderUsers();
+        renderLogs(lg.logs || []);
+      }
+
+      function renderCodes() {
+        const filter = document.getElementById('codeFilter').value;
+        const rows = cachedCodes.filter((c) => {
+          if (filter === 'unused') return !c.revoked && !c.redeemedBy;
+          if (filter === 'redeemed') return Boolean(c.redeemedBy);
+          if (filter === 'revoked') return Boolean(c.revoked);
+          return true;
+        });
+
+        const tbody = document.getElementById('codesTbody');
+        if (rows.length === 0) {
+          tbody.innerHTML = '<tr><td colspan="7" class="muted" style="text-align:center;padding:18px;">暂无激活码记录</td></tr>';
+          return;
+        }
+        tbody.innerHTML = rows
+          .map((c) => {
+            let statusHtml = '<span class="pill pill-green">未使用</span>';
+            if (c.revoked) statusHtml = '<span class="pill pill-gray">已作废</span>';
+            else if (c.redeemedBy) statusHtml = '<span class="pill pill-blue">已兑换</span>';
+
+            const redeemedInfo = c.redeemedBy
+              ? esc(c.redeemedBy) + ' · ' + esc(fmtTime(c.redeemedAt))
+              : c.revoked
+                ? '作废于 ' + esc(fmtTime(c.revokedAt))
+                : '-';
+
+            const actions =
+              !c.redeemedBy && !c.revoked
+                ? '<button class="btn btn-ghost btn-sm" onclick="copyText(\'' + esc(c.code) + '\')">复制</button> ' +
+                  '<button class="btn btn-danger btn-sm" onclick="revokeOne(\'' + esc(c.code) + '\')">作废</button>'
+                : '-';
+
+            return (
+              '<tr>' +
+              '<td><code>' + esc(c.code) + '</code></td>' +
+              '<td>' + esc(c.pages) + ' 页</td>' +
+              '<td>¥' + Number(c.priceCny || 0).toFixed(2) + '</td>' +
+              '<td>' + esc([c.channel, c.note].filter(Boolean).join(' / ') || '-') + '</td>' +
+              '<td>' + statusHtml + '</td>' +
+              '<td>' + redeemedInfo + '</td>' +
+              '<td>' + actions + '</td>' +
+              '</tr>'
+            );
+          })
+          .join('');
+      }
+
+      function renderUsers() {
+        const kw = document.getElementById('userSearch').value.trim().toLowerCase();
+        const rows = cachedUsers.filter(
+          (u) => !kw || u.userId.toLowerCase().includes(kw) || (u.tenantKey || '').toLowerCase().includes(kw)
+        );
+        const tbody = document.getElementById('usersTbody');
+        if (rows.length === 0) {
+          tbody.innerHTML = '<tr><td colspan="9" class="muted" style="text-align:center;padding:18px;">暂无用户记录</td></tr>';
+          return;
+        }
+        tbody.innerHTML = rows
+          .map((u) => {
+            const tierPill =
+              u.tier === 'pro'
+                ? '<span class="pill pill-orange">Pro</span>'
+                : '<span class="pill pill-gray">免费</span>';
+            return (
+              '<tr>' +
+              '<td><code>' + esc(u.userId) + '</code>' + (u.tenantKey ? '<div class="muted">' + esc(u.tenantKey) + '</div>' : '') + '</td>' +
+              '<td>' + tierPill + '</td>' +
+              '<td><strong>' + esc(u.totalAvailable) + '</strong></td>' +
+              '<td>' + esc(u.dailyRemaining) + '</td>' +
+              '<td>' + esc(u.welcomeRemaining) + '</td>' +
+              '<td>' + esc(u.paidRemaining) + '</td>' +
+              '<td>' + esc(u.totalUsedPages) + '</td>' +
+              '<td>' + esc(fmtTime(u.lastActiveAt)) + '</td>' +
+              '<td><button class="btn btn-ghost btn-sm" onclick="grantUser(\'' + esc(u.userId) + '\')">补发/调额</button></td>' +
+              '</tr>'
+            );
+          })
+          .join('');
+      }
+
+      function renderLogs(logs) {
+        const tbody = document.getElementById('logsTbody');
+        if (logs.length === 0) {
+          tbody.innerHTML = '<tr><td colspan="8" class="muted" style="text-align:center;padding:18px;">暂无提取流水</td></tr>';
+          return;
+        }
+        tbody.innerHTML = logs
+          .map((l) => {
+            const st =
+              l.status === 'ok'
+                ? '<span class="pill pill-green">成功</span>'
+                : '<span class="pill pill-red" title="' + esc(l.error || '') + '">失败</span>';
+            return (
+              '<tr>' +
+              '<td>' + esc(fmtTime(l.createdAt)) + '</td>' +
+              '<td><code>' + esc(l.userId) + '</code></td>' +
+              '<td>' + (l.tier === 'pro' ? 'Pro' : '免费') + '</td>' +
+              '<td>' + esc(l.model) + '</td>' +
+              '<td>' + esc(l.pages) + '</td>' +
+              '<td>' + esc(l.rowsExtracted) + '</td>' +
+              '<td>¥' + Number(l.estimatedCostCny || 0).toFixed(4) + '</td>' +
+              '<td>' + st + (l.error ? ' <span class="muted">' + esc(l.error.slice(0, 40)) + '</span>' : '') + '</td>' +
+              '</tr>'
+            );
+          })
+          .join('');
+      }
+
+      window.copyText = async function (text) {
+        try {
+          await navigator.clipboard.writeText(text);
+          showToast('已复制：' + text);
+        } catch {
+          showToast('复制失败，请手动选中复制', true);
+        }
+      };
+
+      window.revokeOne = async function (code) {
+        if (!confirm('确认作废激活码 ' + code + '？作废后无法恢复。')) return;
+        try {
+          await api('/api/admin/codes/' + encodeURIComponent(code) + '/revoke', { method: 'POST' });
+          showToast('已作废激活码 ' + code);
+          await loadAll();
+        } catch (err) {
+          showToast(err.message, true);
+        }
+      };
+
+      window.grantUser = async function (userId) {
+        const raw = prompt('为用户 ' + userId + ' 调整付费永久页数（正数赠送，负数扣减，例如 20 或 -10）：', '20');
+        if (raw === null) return;
+        const delta = Number(raw);
+        if (!Number.isFinite(delta) || delta === 0) {
+          showToast('请输入非零数字', true);
+          return;
+        }
+        try {
+          await api('/api/admin/users/' + encodeURIComponent(userId) + '/grant', {
+            method: 'POST',
+            body: JSON.stringify({ deltaPages: delta }),
+          });
+          showToast('已为用户 ' + userId + ' 调整 ' + (delta > 0 ? '+' : '') + delta + ' 页');
+          await loadAll();
+        } catch (err) {
+          showToast(err.message, true);
+        }
+      };
+
+      async function enterApp(token) {
+        adminToken = token;
+        try {
+          await loadAll();
+          sessionStorage.setItem(TOKEN_KEY, adminToken);
+          document.getElementById('loginView').classList.add('hidden');
+          document.getElementById('appView').classList.remove('hidden');
+          document.getElementById('loginErr').classList.add('hidden');
+        } catch (err) {
+          sessionStorage.removeItem(TOKEN_KEY);
+          const errEl = document.getElementById('loginErr');
+          errEl.textContent = err.message;
+          errEl.classList.remove('hidden');
+        }
+      }
+
+      document.getElementById('loginBtn').onclick = () => {
+        const val = document.getElementById('tokenInput').value.trim();
+        if (val) enterApp(val);
+      };
+      document.getElementById('tokenInput').addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') document.getElementById('loginBtn').click();
+      });
+
+      document.getElementById('logoutBtn').onclick = () => {
+        sessionStorage.removeItem(TOKEN_KEY);
+        adminToken = '';
+        document.getElementById('appView').classList.add('hidden');
+        document.getElementById('loginView').classList.remove('hidden');
+        document.getElementById('tokenInput').value = '';
+      };
+
+      document.getElementById('refreshBtn').onclick = () =>
+        loadAll().then(() => showToast('数据已刷新')).catch((e) => showToast(e.message, true));
+
+      document.querySelectorAll('.tab').forEach((btn) => {
+        btn.onclick = () => {
+          document.querySelectorAll('.tab').forEach((b) => b.classList.remove('active'));
+          btn.classList.add('active');
+          const target = btn.dataset.tab;
+          ['codes', 'users', 'logs'].forEach((t) => {
+            document.getElementById('tab-' + t).classList.toggle('hidden', t !== target);
+          });
+        };
+      });
+
+      document.querySelectorAll('.preset').forEach((btn) => {
+        btn.onclick = () => {
+          document.getElementById('genPages').value = btn.dataset.pages;
+          document.getElementById('genPrice').value = btn.dataset.price;
+          document.getElementById('genNote').value = btn.dataset.note;
+        };
+      });
+
+      document.getElementById('genBtn').onclick = async () => {
+        try {
+          const count = Number(document.getElementById('genCount').value);
+          const pages = Number(document.getElementById('genPages').value);
+          const priceCny = Number(document.getElementById('genPrice').value);
+          const channel = document.getElementById('genChannel').value;
+          const note = document.getElementById('genNote').value.trim();
+
+          const data = await api('/api/admin/codes/generate', {
+            method: 'POST',
+            body: JSON.stringify({ count, pages, priceCny, channel, note }),
+          });
+          freshGenerated = (data.codes || []).map((c) => c.code);
+          document.getElementById('freshCodesList').textContent = freshGenerated.join('\n');
+          document.getElementById('freshCodesBox').classList.remove('hidden');
+          showToast('成功生成 ' + freshGenerated.length + ' 个激活码！');
+          await loadAll();
+        } catch (err) {
+          showToast(err.message, true);
+        }
+      };
+
+      document.getElementById('copyFreshBtn').onclick = () => copyText(freshGenerated.join('\n'));
+      document.getElementById('codeFilter').onchange = renderCodes;
+      document.getElementById('userSearch').oninput = renderUsers;
+
+      if (adminToken) {
+        enterApp(adminToken);
+      }
+    </script>
+  </body>
+</html>
