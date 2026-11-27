@@ -434,7 +434,7 @@ async function callMultimodalLLM(
   const response = await fetch(`${baseUrl}/chat/completions`, {
     method: 'POST',
     redirect: 'manual',
-    signal: AbortSignal.timeout(60000),
+    signal: AbortSignal.timeout(90000),
     headers: {
       'Content-Type': 'application/json',
       Authorization: `Bearer ${llm.apiKey}`,
@@ -442,6 +442,9 @@ async function callMultimodalLLM(
     body: JSON.stringify({
       model: modelName,
       temperature: 0.1,
+      ...(baseUrl.includes('volces.com') && /seed/i.test(modelName)
+        ? { thinking: { type: 'disabled' } }
+        : {}),
       messages: [
         { role: 'system', content: systemPrompt },
         { role: 'user', content: userContent },
@@ -921,6 +924,9 @@ app.post('/api/clean-rules', async (req, res) => {
         body: JSON.stringify({
           model: chosenModel,
           temperature: 0.1,
+          ...(baseUrl.includes('volces.com') && /seed/i.test(chosenModel)
+            ? { thinking: { type: 'disabled' } }
+            : {}),
           messages: [
             { role: 'system', content: systemPrompt },
             { role: 'user', content: userPrompt },
@@ -1056,6 +1062,9 @@ app.post('/api/reconcile-suggest', async (req, res) => {
       body: JSON.stringify({
         model: llm.freeModel,
         temperature: 0.1,
+        ...(baseUrl.includes('volces.com') && /seed/i.test(llm.freeModel)
+          ? { thinking: { type: 'disabled' } }
+          : {}),
         messages: [
           {
             role: 'system',
