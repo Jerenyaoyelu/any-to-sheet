@@ -341,16 +341,25 @@ export class MockHostAdapter implements HostAdapter {
 
   async readTableRecords(
     tableId?: string,
-    limit = 200
-  ): Promise<{ schema: TableSchema; records: TableRecordRow[] }> {
+    limit = 500
+  ): Promise<{
+    schema: TableSchema;
+    records: TableRecordRow[];
+    totalCount: number;
+    truncated: boolean;
+  }> {
     const schema = await this.getActiveTableSchema(tableId);
     const list = this.recordsByTable[schema.tableId] || [];
+    const sliced = list.slice(0, limit).map((r) => ({
+      recordId: r.recordId,
+      values: { ...r.values },
+      rawValues: { ...r.values },
+    }));
     return {
       schema,
-      records: list.slice(0, limit).map((r) => ({
-        recordId: r.recordId,
-        values: { ...r.values },
-      })),
+      records: sliced,
+      totalCount: list.length,
+      truncated: list.length > sliced.length,
     };
   }
 

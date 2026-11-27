@@ -771,10 +771,63 @@ export default function App() {
         </button>
       </nav>
 
-      {/* Step 1: Target Table Schema */}
-      <section className="card">
-        <div className="card-header">
-          <strong>1. 当前表头</strong>
+      {/* Step 1: Full schema card on Extract tab; compact 1-line bar on Clean/Reconcile/DocGen tabs to save 400px sidebar space */}
+      {mainTab === 'extract' ? (
+        <section className="card">
+          <div className="card-header">
+            <strong>1. 当前表头</strong>
+            <div className="row-actions">
+              {isMock && (
+                <select
+                  className="select"
+                  value={demoKey}
+                  onChange={(e) => handleRefreshSchema(e.target.value as keyof typeof DEMO_SCHEMAS)}
+                >
+                  <option value="quote">示例：供应商报价单</option>
+                  <option value="resume">示例：HR 简历初筛</option>
+                  <option value="expense">示例：票据/转账台账</option>
+                </select>
+              )}
+              <button
+                className="btn btn-ghost"
+                title="列有改动时重新读取。换一张表会自动更新。"
+                onClick={() => handleRefreshSchema()}
+              >
+                重新读取
+              </button>
+            </div>
+          </div>
+          {initError ? (
+            <div className="alert alert-error">{initError}</div>
+          ) : schema ? (
+            <>
+              <div className="table-title">当前数据表：{schema.tableName}</div>
+              <div className="table-hint">
+                从当前数据表自动读取。换一张表，下面的文件和提取结果会换成那张表上一次的；关掉插件再打开会清空。
+              </div>
+              <div className="field-tags">
+                {writableFields.map((f) => (
+                  <span
+                    key={f.id}
+                    className="field-tag"
+                    title={f.options ? `选项: ${f.options.map((o) => o.name).join(' / ')}` : ''}
+                  >
+                    {f.name}
+                    <em>{FIELD_TYPE_LABEL[f.type] || f.type}</em>
+                  </span>
+                ))}
+              </div>
+            </>
+          ) : (
+            <div className="muted">正在读取表格结构...</div>
+          )}
+        </section>
+      ) : (
+        <div className="compact-table-bar">
+          <span className="compact-table-name">
+            当前表：<strong>{schema?.tableName || '读取中...'}</strong>
+            {schema ? <small className="muted">（{writableFields.length} 列）</small> : null}
+          </span>
           <div className="row-actions">
             {isMock && (
               <select
@@ -782,45 +835,17 @@ export default function App() {
                 value={demoKey}
                 onChange={(e) => handleRefreshSchema(e.target.value as keyof typeof DEMO_SCHEMAS)}
               >
-                <option value="quote">示例：供应商报价单</option>
-                <option value="resume">示例：HR 简历初筛</option>
-                <option value="expense">示例：票据/转账台账</option>
+                <option value="quote">供应商报价单</option>
+                <option value="resume">HR 简历初筛</option>
+                <option value="expense">票据/转账台账</option>
               </select>
             )}
-            <button
-              className="btn btn-ghost"
-              title="列有改动时重新读取。换一张表会自动更新。"
-              onClick={() => handleRefreshSchema()}
-            >
-              重新读取
+            <button className="btn btn-ghost" onClick={() => handleRefreshSchema()}>
+              刷新
             </button>
           </div>
         </div>
-        {initError ? (
-          <div className="alert alert-error">{initError}</div>
-        ) : schema ? (
-          <>
-            <div className="table-title">当前数据表：{schema.tableName}</div>
-            <div className="table-hint">
-              从当前数据表自动读取。换一张表，下面的文件和提取结果会换成那张表上一次的；关掉插件再打开会清空。
-            </div>
-            <div className="field-tags">
-              {writableFields.map((f) => (
-                <span
-                  key={f.id}
-                  className="field-tag"
-                  title={f.options ? `选项: ${f.options.map((o) => o.name).join(' / ')}` : ''}
-                >
-                  {f.name}
-                  <em>{FIELD_TYPE_LABEL[f.type] || f.type}</em>
-                </span>
-              ))}
-            </div>
-          </>
-        ) : (
-          <div className="muted">正在读取表格结构...</div>
-        )}
-      </section>
+      )}
 
       {/* Step 2 & 3 for Extract Tab, or modular Feature Tabs */}
       {mainTab === 'clean' && (
@@ -829,10 +854,13 @@ export default function App() {
           schema={schema}
           identity={identity}
           onQuotaUpdate={setQuota}
+          onNeedRedeem={() => setShowRedeem(true)}
         />
       )}
 
-      {mainTab === 'reconcile' && <ReconcileTab adapter={adapter} schema={schema} />}
+      {mainTab === 'reconcile' && (
+        <ReconcileTab adapter={adapter} schema={schema} identity={identity} />
+      )}
 
       {mainTab === 'docgen' && <DocGenTab adapter={adapter} schema={schema} />}
 

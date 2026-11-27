@@ -8,6 +8,7 @@ import multer from 'multer';
 import {
   buildCleanRulePrompt,
   buildExtractionPrompt,
+  sanitizeCleanRuleSteps,
   suggestReconcileMapping,
   validateExtractionItems,
   type CleanRulePlan,
@@ -356,6 +357,23 @@ function generateMockItems(schema: TableSchema, fileNames: string[]): Extraction
   return results;
 }
 
+function formatFriendlyLlmError(status: number, errText: string, modelName: string): string {
+  console.error(`[llm-upstream-error] status=${status} model=${modelName} body=${errText.slice(0, 400)}`);
+  if (status === 404 || /InvalidEndpointOrModel|NotFound/i.test(errText)) {
+    return `模型「${modelName}」不可用或未在模型平台开通，请管理员在后台 /admin 或 .env 中核对模型 ID / 接入点配置。`;
+  }
+  if (status === 401 || status === 403) {
+    return '模型 API Key 无效或无调用权限，请管理员检查密钥配置。';
+  }
+  if (status === 429) {
+    return '上游大模型请求过于频繁或账号额度已满，请稍后再试。';
+  }
+  if (status >= 500) {
+    return `上游大模型服务暂时异常 (${status})，请稍后重试（本次未扣额度）。`;
+  }
+  return `大模型调用失败 (${status})，请稍后重试或联系管理员检查配置（本次未扣额度）。`;
+}
+
 async function callMultimodalLLM(
   modelName: string,
   schema: TableSchema,
@@ -436,7 +454,7 @@ async function callMultimodalLLM(
   }
   if (!response.ok) {
     const errText = await response.text();
-    throw new Error(`LLM API 调用失败 (${response.status}): ${errText.slice(0, 300)}`);
+    throw new Error(formatFriendlyLlmError(response.status, errText, modelName));
   }
 
   const data = (await response.json()) as {
@@ -845,11 +863,15 @@ app.post('/api/clean-rules', async (req, res) => {
       return;
     }
 
-    const fieldName = typeof req.body?.fieldName === 'string' ? req.body.fieldName.trim() : '';
-    const fieldType = typeof req.body?.fieldType === 'string' ? req.body.fieldType.trim() : 'text';
-    const instruction = typeof req.body?.instruction === 'string' ? req.body.instruction.trim() : '';
+    const fieldName = typeof req.body?.fieldName === 'string' ? req.body.fieldName.trim().slice(0, 80) : '';
+    const fieldType = typeof req.body?.fieldType === 'string' ? req.body.fieldType.trim().slice(0, 32) : 'text';
+    const instruction =
+      typeof req.body?.instruction === 'string' ? req.body.instruction.trim().slice(0, 500) : '';
     const samples: string[] = Array.isArray(req.body?.samples)
-      ? req.body.samples.map((x: unknown) => String(x ?? '')).filter(Boolean).slice(0, 20)
+      ? req.body.samples
+          .map((x: unknown) => String(x ?? '').slice(0, 300))
+          .filter(Boolean)
+          .slice(0, 20)
       : [];
 
     if (!fieldName || !instruction) {
@@ -908,7 +930,7 @@ app.post('/api/clean-rules', async (req, res) => {
 
       if (!response.ok) {
         const errText = await response.text();
-        throw new Error(`LLM API 调用失败 (${response.status}): ${errText.slice(0, 240)}`);
+        throw new Error(formatFriendlyLlmError(response.status, errText, chosenModel));
       }
 
       const data = (await response.json()) as {
@@ -916,18 +938,19 @@ app.post('/api/clean-rules', async (req, res) => {
         usage?: { prompt_tokens?: number; completion_tokens?: number };
       };
       const rawContent = data.choices?.[0]?.message?.content;
-      if (!rawContent) throw new Error('大模型未返回有效清洗规则');
+      if (!rawContent) throw new Error('大模型未返回有效清洗规则，本次未扣额度');
 
       const parsed = parseFirstJsonObject<Partial<CleanRulePlan>>(rawContent);
-      if (!parsed || !Array.isArray(parsed.steps) || parsed.steps.length === 0) {
-        throw new Error('大模型未生成有效清洗步骤，请尝试更具体地描述需求');
+      const safeSteps = sanitizeCleanRuleSteps(parsed?.steps);
+      if (safeSteps.length === 0) {
+        throw new Error('未能解析出安全有效的清洗步骤，请换个更具体的描述重试（本次未扣额度）');
       }
       plan = {
         summary:
-          typeof parsed.summary === 'string' && parsed.summary.trim()
-            ? parsed.summary.trim()
+          typeof parsed?.summary === 'string' && parsed.summary.trim()
+            ? parsed.summary.trim().slice(0, 160)
             : instruction,
-        steps: parsed.steps,
+        steps: safeSteps,
       };
       promptTokens = data.usage?.prompt_tokens ?? 0;
       completionTokens = data.usage?.completion_tokens ?? 0;
@@ -975,13 +998,32 @@ app.post('/api/clean-rules', async (req, res) => {
   } catch (err) {
     if (reservationId) {
       quotaStore.release(reservationId);
+      quotaStore.recordLog({
+        userId: reservedUserId || 'unknown',
+        tier: reservedTier,
+        mode: runtimeConfig.getEffective().apiKey ? 'llm' : 'mock',
+        model: runtimeConfig.getEffective().apiKey ? chosenModel : 'mock-demo',
+        pages: 1,
+        rowsExtracted: 0,
+        estimatedCostCny: 0,
+        status: 'error',
+        error: err instanceof Error ? err.message.slice(0, 180) : '生成清洗规则失败',
+      });
     }
     const message = err instanceof Error ? err.message : '生成清洗规则失败';
+    console.error('[clean-rules error]', err);
     res.status(500).json({ error: message });
   }
 });
 
 app.post('/api/reconcile-suggest', async (req, res) => {
+  const leftHeaders: string[] = Array.isArray(req.body?.leftHeaders)
+    ? req.body.leftHeaders.map((x: unknown) => String(x ?? '').trim().slice(0, 80)).filter(Boolean).slice(0, 40)
+    : [];
+  const rightHeaders: string[] = Array.isArray(req.body?.rightHeaders)
+    ? req.body.rightHeaders.map((x: unknown) => String(x ?? '').trim().slice(0, 80)).filter(Boolean).slice(0, 40)
+    : [];
+
   try {
     const clientIp = getClientIp(req);
     const ipCheck = quotaStore.checkIpRateLimit(clientIp, 'reconcile_suggest', 12);
@@ -989,13 +1031,6 @@ app.post('/api/reconcile-suggest', async (req, res) => {
       res.status(429).json({ error: `请求过于频繁，请 ${ipCheck.retryAfterSec} 秒后再试` });
       return;
     }
-
-    const leftHeaders: string[] = Array.isArray(req.body?.leftHeaders)
-      ? req.body.leftHeaders.map(String).slice(0, 50)
-      : [];
-    const rightHeaders: string[] = Array.isArray(req.body?.rightHeaders)
-      ? req.body.rightHeaders.map(String).slice(0, 50)
-      : [];
 
     if (leftHeaders.length === 0 || rightHeaders.length === 0) {
       res.status(400).json({ error: '缺少左右两表的表头列表' });
@@ -1009,6 +1044,7 @@ app.post('/api/reconcile-suggest', async (req, res) => {
       return;
     }
 
+    const { userId } = getUserHeaders(req);
     const baseUrl = await assertPublicHttpsBaseUrl(llm.baseUrl);
     const response = await fetch(`${baseUrl}/chat/completions`, {
       method: 'POST',
@@ -1035,26 +1071,48 @@ app.post('/api/reconcile-suggest', async (req, res) => {
     });
 
     if (!response.ok) {
-      res.json({ ok: true, mode: 'heuristic', mapping: fallback });
+      const errText = await response.text();
+      const friendly = formatFriendlyLlmError(response.status, errText, llm.freeModel);
+      res.json({ ok: true, mode: 'heuristic', fallbackReason: friendly, mapping: fallback });
       return;
     }
 
     const data = (await response.json()) as {
       choices?: Array<{ message?: { content?: string } }>;
+      usage?: { prompt_tokens?: number; completion_tokens?: number };
     };
     const raw = data.choices?.[0]?.message?.content;
-    if (!raw) {
-      res.json({ ok: true, mode: 'heuristic', mapping: fallback });
-      return;
-    }
+    const parsed = raw
+      ? parseFirstJsonObject<{
+          leftKeyCol?: string;
+          rightKeyCol?: string;
+          comparePairs?: Array<{ leftCol: string; rightCol: string }>;
+        }>(raw)
+      : null;
 
-    const parsed = parseFirstJsonObject<{
-      leftKeyCol?: string;
-      rightKeyCol?: string;
-      comparePairs?: Array<{ leftCol: string; rightCol: string }>;
-    }>(raw);
+    const costCny = estimateModelCostCny(
+      llm.freeModel,
+      data.usage?.prompt_tokens ?? 0,
+      data.usage?.completion_tokens ?? 0
+    );
+    quotaStore.recordLog({
+      userId,
+      tier: 'free',
+      mode: 'llm',
+      model: llm.freeModel,
+      pages: 0,
+      rowsExtracted: 0,
+      estimatedCostCny: costCny,
+      status: 'ok',
+    });
+
     if (!parsed) {
-      res.json({ ok: true, mode: 'heuristic', mapping: fallback });
+      res.json({
+        ok: true,
+        mode: 'heuristic',
+        fallbackReason: 'AI 返回格式未识别，已自动使用本地规则对齐',
+        mapping: fallback,
+      });
       return;
     }
 
@@ -1078,11 +1136,10 @@ app.post('/api/reconcile-suggest', async (req, res) => {
       mapping: { leftKeyCol, rightKeyCol, comparePairs },
     });
   } catch {
-    const leftHeaders: string[] = Array.isArray(req.body?.leftHeaders) ? req.body.leftHeaders.map(String) : [];
-    const rightHeaders: string[] = Array.isArray(req.body?.rightHeaders) ? req.body.rightHeaders.map(String) : [];
     res.json({
       ok: true,
       mode: 'heuristic',
+      fallbackReason: 'AI 暂不可用，已自动使用本地规则对齐',
       mapping: suggestReconcileMapping(leftHeaders, rightHeaders),
     });
   }

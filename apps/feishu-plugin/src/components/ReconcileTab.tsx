@@ -11,24 +11,58 @@ import {
   type SimpleTableData,
   type TableSchema,
   type TableSummary,
+  type UserIdentity,
 } from '@table-ai/core';
 
 interface ReconcileTabProps {
   adapter: HostAdapter | null;
   schema: TableSchema | null;
+  identity: UserIdentity | null;
 }
 
 type RightSourceMode = 'bitable' | 'paste' | 'csv';
 
+async function safeParseJson(res: Response): Promise<Record<string, unknown>> {
+  const text = await res.text();
+  try {
+    return JSON.parse(text) as Record<string, unknown>;
+  } catch {
+    return { error: `服务端返回异常 (${res.status})：${text.slice(0, 120)}` };
+  }
+}
+
+/** Auto-detects UTF-8 vs Windows Excel GBK/GB18030 CSV encoding without dependencies */
+function decodeCsvArrayBuffer(buf: ArrayBuffer): { text: string; encoding: string } {
+  const bytes = new Uint8Array(buf);
+  if (bytes.length >= 3 && bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf) {
+    return { text: new TextDecoder('utf-8').decode(bytes.subarray(3)), encoding: 'UTF-8 BOM' };
+  }
+  if (bytes.length >= 2 && bytes[0] === 0xff && bytes[1] === 0xfe) {
+    return { text: new TextDecoder('utf-16le').decode(bytes.subarray(2)), encoding: 'UTF-16LE' };
+  }
+  try {
+    const utf8 = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+    return { text: utf8, encoding: 'UTF-8' };
+  } catch {
+    try {
+      const gbk = new TextDecoder('gb18030').decode(bytes);
+      return { text: gbk, encoding: 'GB18030/GBK' };
+    } catch {
+      return { text: new TextDecoder('utf-8').decode(bytes), encoding: 'UTF-8' };
+    }
+  }
+}
+
+/** Includes Formula / AutoNumber / Lookup columns (all non-attachment columns) for reconciliation */
 function recordsToSimpleTable(
   schema: TableSchema,
   records: Array<{ recordId: string; values: Record<string, unknown> }>
 ): SimpleTableData {
-  const writable = schema.fields.filter((f) => !f.readonly && f.type !== 'unknown');
-  const headers = writable.map((f) => f.name);
+  const readable = schema.fields.filter((f) => f.rawType !== 17); // Exclude Attachment (17)
+  const headers = readable.map((f) => f.name);
   const rows = records.map((r) => {
     const obj: Record<string, string> = {};
-    for (const f of writable) {
+    for (const f of readable) {
       const val = r.values[f.id];
       obj[f.name] = Array.isArray(val) ? val.join(', ') : val == null ? '' : String(val);
     }
@@ -37,8 +71,9 @@ function recordsToSimpleTable(
   return { name: schema.tableName, headers, rows };
 }
 
-export default function ReconcileTab({ adapter, schema }: ReconcileTabProps) {
+export default function ReconcileTab({ adapter, schema, identity }: ReconcileTabProps) {
   const [leftTable, setLeftTable] = useState<SimpleTableData | null>(null);
+  const [leftTruncated, setLeftTruncated] = useState<{ loaded: number; total: number } | null>(null);
   const [otherTables, setOtherTables] = useState<TableSummary[]>([]);
 
   const [rightMode, setRightMode] = useState<RightSourceMode>('bitable');
@@ -50,6 +85,7 @@ export default function ReconcileTab({ adapter, schema }: ReconcileTabProps) {
   const [rightKeyCol, setRightKeyCol] = useState('');
   const [comparePairs, setComparePairs] = useState<ReconcileColumnPair[]>([]);
   const [tolerance, setTolerance] = useState(0.05);
+  const [tolerantMode, setTolerantMode] = useState(true);
 
   const [loading, setLoading] = useState(false);
   const [aiMatching, setAiMatching] = useState(false);
@@ -61,7 +97,21 @@ export default function ReconcileTab({ adapter, schema }: ReconcileTabProps) {
 
   const csvInputRef = useRef<HTMLInputElement>(null);
 
-  // Load left table (active table) and list sibling tables in the same Base
+  const schemaSig = useMemo(
+    () => `${schema?.tableId || ''}::${schema?.fields.map((f) => f.id).join(',') || ''}`,
+    [schema]
+  );
+
+  const hasNumericCompare = useMemo(
+    () =>
+      comparePairs.some((p) =>
+        /金额|总价|合计|实付|总额|单价|数量|件数|年限|total|amount|price|qty|count/i.test(
+          `${p.leftCol} ${p.rightCol}`
+        )
+      ),
+    [comparePairs]
+  );
+
   useEffect(() => {
     if (!adapter?.readTableRecords || !schema) return;
     let cancelled = false;
@@ -69,13 +119,18 @@ export default function ReconcileTab({ adapter, schema }: ReconcileTabProps) {
     setSummary(null);
 
     Promise.all([
-      adapter.readTableRecords(schema.tableId, 300),
+      adapter.readTableRecords(schema.tableId, 500),
       adapter.listTables ? adapter.listTables() : Promise.resolve([]),
     ])
       .then(([leftRes, tables]) => {
         if (cancelled) return;
         const leftData = recordsToSimpleTable(leftRes.schema, leftRes.records);
         setLeftTable(leftData);
+        setLeftTruncated(
+          leftRes.truncated
+            ? { loaded: leftRes.records.length, total: leftRes.totalCount ?? leftRes.records.length }
+            : null
+        );
         const siblings = tables.filter((t) => t.tableId !== schema.tableId);
         setOtherTables(siblings);
         if (siblings.length > 0) {
@@ -101,14 +156,13 @@ export default function ReconcileTab({ adapter, schema }: ReconcileTabProps) {
     return () => {
       cancelled = true;
     };
-  }, [adapter, schema?.tableId]);
+  }, [adapter, schemaSig]);
 
-  // Auto-load sibling table B when selected
   useEffect(() => {
     if (rightMode !== 'bitable' || !rightTableId || !adapter?.readTableRecords) return;
     let cancelled = false;
     adapter
-      .readTableRecords(rightTableId, 300)
+      .readTableRecords(rightTableId, 500)
       .then((res) => {
         if (cancelled) return;
         const data = recordsToSimpleTable(res.schema, res.records);
@@ -128,7 +182,6 @@ export default function ReconcileTab({ adapter, schema }: ReconcileTabProps) {
     };
   }, [adapter, rightMode, rightTableId]);
 
-  // Auto-suggest column mapping whenever left or right headers change
   useEffect(() => {
     if (!leftTable || !rightTable || leftTable.headers.length === 0 || rightTable.headers.length === 0) {
       return;
@@ -142,14 +195,17 @@ export default function ReconcileTab({ adapter, schema }: ReconcileTabProps) {
   function handleParsePaste() {
     const parsed = parseDelimitedTable(pasteText, '粘贴的外部表格');
     if (parsed.headers.length === 0 || parsed.rows.length === 0) {
-      setNotice({ type: 'error', text: '未解析到有效表头和行数据，请从 Excel/WPS 复制含表头的区域后粘贴。' });
+      setNotice({
+        type: 'error',
+        text: '未解析到有效表头和行数据，请从 Excel/WPS 复制含表头的区域后粘贴。',
+      });
       return;
     }
     setRightTable(parsed);
     setSummary(null);
     setNotice({
       type: 'info',
-      text: `已解析外部表格：${parsed.headers.length} 列，${parsed.rows.length} 行数据，已自动推荐对账字段。`,
+      text: `已解析外部表格：${parsed.headers.length} 列，${parsed.rows.length} 行，已自动推荐对账字段。`,
     });
   }
 
@@ -158,7 +214,8 @@ export default function ReconcileTab({ adapter, schema }: ReconcileTabProps) {
     if (!file) return;
     const reader = new FileReader();
     reader.onload = () => {
-      const text = String(reader.result || '');
+      const buf = reader.result as ArrayBuffer;
+      const { text, encoding } = decodeCsvArrayBuffer(buf);
       const parsed = parseDelimitedTable(text, file.name);
       if (parsed.headers.length === 0) {
         setNotice({ type: 'error', text: 'CSV 文件为空或格式无法解析' });
@@ -168,10 +225,10 @@ export default function ReconcileTab({ adapter, schema }: ReconcileTabProps) {
       setSummary(null);
       setNotice({
         type: 'info',
-        text: `已载入「${file.name}」：${parsed.headers.length} 列，${parsed.rows.length} 行。`,
+        text: `已载入「${file.name}」（自动识别编码 ${encoding}）：${parsed.headers.length} 列，${parsed.rows.length} 行。`,
       });
     };
-    reader.readAsText(file, 'utf-8');
+    reader.readAsArrayBuffer(file);
     e.target.value = '';
   }
 
@@ -180,16 +237,20 @@ export default function ReconcileTab({ adapter, schema }: ReconcileTabProps) {
     setAiMatching(true);
     setNotice(null);
     try {
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+      if (identity?.userId) headers['x-user-id'] = identity.userId;
+      if (identity?.tenantKey) headers['x-tenant-key'] = identity.tenantKey;
+
       const res = await fetch('/api/reconcile-suggest', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers,
         body: JSON.stringify({
           leftHeaders: leftTable.headers,
           rightHeaders: rightTable.headers,
         }),
       });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || '列名对齐失败');
+      const data = await safeParseJson(res);
+      if (!res.ok) throw new Error(String(data.error || '列名对齐失败'));
       const m = data.mapping as {
         leftKeyCol: string;
         rightKeyCol: string;
@@ -198,9 +259,11 @@ export default function ReconcileTab({ adapter, schema }: ReconcileTabProps) {
       setLeftKeyCol(m.leftKeyCol);
       setRightKeyCol(m.rightKeyCol);
       setComparePairs(m.comparePairs);
+      const fallbackNote =
+        typeof data.fallbackReason === 'string' ? `（${data.fallbackReason}）` : '';
       setNotice({
-        type: 'success',
-        text: `已自动对齐主键「${m.leftKeyCol} ↔ ${m.rightKeyCol}」及 ${m.comparePairs.length} 组比对列（${data.mode === 'llm' ? 'AI 语义识别' : '规则匹配'}）。`,
+        type: data.mode === 'llm' ? 'success' : 'info',
+        text: `已对齐主键「${m.leftKeyCol} ↔ ${m.rightKeyCol}」及 ${m.comparePairs.length} 组比对列（${data.mode === 'llm' ? 'AI 语义识别' : '本地规则匹配'}）${fallbackNote}。`,
       });
     } catch (err) {
       setNotice({
@@ -227,6 +290,7 @@ export default function ReconcileTab({ adapter, schema }: ReconcileTabProps) {
       rightKeyCol,
       comparePairs,
       numericTolerance: tolerance,
+      tolerantMode,
     });
     setSummary(result);
     setStatusFilter(
@@ -242,11 +306,15 @@ export default function ReconcileTab({ adapter, schema }: ReconcileTabProps) {
     const csv = buildReconcileCsvReport(summary);
     const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
     const url = URL.createObjectURL(blob);
+    const d = new Date();
+    const dateStr = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
     const a = document.createElement('a');
     a.href = url;
-    a.download = `对账差异报告_${new Date().toISOString().slice(0, 10)}.csv`;
+    a.download = `对账差异报告_${dateStr}.csv`;
+    document.body.appendChild(a);
     a.click();
-    URL.revokeObjectURL(url);
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 5000);
   }
 
   const filteredResults = useMemo(() => {
@@ -259,7 +327,7 @@ export default function ReconcileTab({ adapter, schema }: ReconcileTabProps) {
     <div className="tab-stack">
       <section className="card">
         <div className="card-header">
-          <strong>1. 选择对照表（表 B）</strong>
+          <strong>选择对照表（表 B）</strong>
           <div className="tabs">
             {otherTables.length > 0 && (
               <button
@@ -285,7 +353,8 @@ export default function ReconcileTab({ adapter, schema }: ReconcileTabProps) {
         </div>
 
         <div className="muted">
-          左表（表 A）：<strong>{leftTable?.name || schema?.tableName || '-'}</strong>（{leftTable?.rows.length ?? 0} 行）
+          表 A：<strong>{leftTable?.name || schema?.tableName || '-'}</strong>（{leftTable?.rows.length ?? 0} 行
+          {leftTruncated ? ` / 共 ${leftTruncated.total} 行` : ''}）
         </div>
 
         {rightMode === 'bitable' && otherTables.length > 0 && (
@@ -296,7 +365,7 @@ export default function ReconcileTab({ adapter, schema }: ReconcileTabProps) {
           >
             {otherTables.map((t) => (
               <option key={t.tableId} value={t.tableId}>
-                右表（表 B）：{t.tableName}
+                表 B：{t.tableName}
               </option>
             ))}
           </select>
@@ -331,7 +400,7 @@ export default function ReconcileTab({ adapter, schema }: ReconcileTabProps) {
               onChange={handleCsvUpload}
             />
             <button className="btn btn-ghost btn-block" onClick={() => csvInputRef.current?.click()}>
-              选择本地 CSV / TSV 对账文件
+              选择本地 CSV / TSV（自动识别 Excel GBK / UTF-8）
             </button>
           </div>
         )}
@@ -340,7 +409,7 @@ export default function ReconcileTab({ adapter, schema }: ReconcileTabProps) {
       {leftTable && rightTable && rightTable.headers.length > 0 && (
         <section className="card">
           <div className="card-header">
-            <strong>2. 对齐主键与核对列</strong>
+            <strong>对齐主键与核对列</strong>
             <button
               className="btn btn-ghost"
               disabled={aiMatching}
@@ -370,7 +439,7 @@ export default function ReconcileTab({ adapter, schema }: ReconcileTabProps) {
           </div>
 
           <div className="card-header" style={{ marginTop: 4 }}>
-            <span className="sub-label">要核对差异的列（如金额、数量）：</span>
+            <span className="sub-label">要核对差异的列：</span>
             <button className="btn btn-ghost" onClick={handleAddComparePair}>
               + 添加比对列
             </button>
@@ -419,19 +488,29 @@ export default function ReconcileTab({ adapter, schema }: ReconcileTabProps) {
           ))}
 
           <div className="options-row">
-            <label className="pdf-limit">
-              金额容差
-              <select
-                className="select"
-                value={tolerance}
-                onChange={(e) => setTolerance(Number(e.target.value))}
-              >
-                <option value={0}>严格相等 (0)</option>
-                <option value={0.01}>允许 ±0.01</option>
-                <option value={0.05}>允许 ±0.05</option>
-                <option value={1}>允许 ±1.00</option>
-              </select>
+            <label className="tolerant-toggle">
+              <input
+                type="checkbox"
+                checked={tolerantMode}
+                onChange={(e) => setTolerantMode(e.target.checked)}
+              />
+              <span>宽容模式（忽略括号备注、全角与日期格式差）</span>
             </label>
+            {hasNumericCompare && (
+              <label className="pdf-limit">
+                数值容差
+                <select
+                  className="select"
+                  value={tolerance}
+                  onChange={(e) => setTolerance(Number(e.target.value))}
+                >
+                  <option value={0}>严格相等 (0)</option>
+                  <option value={0.01}>允许 ±0.01</option>
+                  <option value={0.05}>允许 ±0.05</option>
+                  <option value={1}>允许 ±1.00</option>
+                </select>
+              </label>
+            )}
           </div>
 
           <button
@@ -449,11 +528,37 @@ export default function ReconcileTab({ adapter, schema }: ReconcileTabProps) {
       {summary && (
         <section className="card">
           <div className="card-header">
-            <strong>3. 对账差异报告</strong>
+            <strong>对账差异报告</strong>
             <button className="btn btn-ghost" onClick={handleExportCsv}>
               导出 CSV 报告
             </button>
           </div>
+
+          {summary.amountSummary && (
+            <div className="amount-summary-bar">
+              <div>
+                <span>表 A ({summary.amountSummary.leftCol})</span>
+                <strong>¥{summary.amountSummary.leftTotal.toLocaleString('zh-CN', { minimumFractionDigits: 2 })}</strong>
+              </div>
+              <div>
+                <span>表 B ({summary.amountSummary.rightCol})</span>
+                <strong>¥{summary.amountSummary.rightTotal.toLocaleString('zh-CN', { minimumFractionDigits: 2 })}</strong>
+              </div>
+              <div>
+                <span>净差额</span>
+                <strong className={summary.amountSummary.netDelta === 0 ? 'delta-ok' : 'delta-tag'}>
+                  {summary.amountSummary.netDelta > 0 ? '+' : ''}¥
+                  {summary.amountSummary.netDelta.toLocaleString('zh-CN', { minimumFractionDigits: 2 })}
+                </strong>
+              </div>
+            </div>
+          )}
+
+          {summary.duplicateKeysDetected && (
+            <div className="muted">
+              提示：检测到重复主键值，已按最小差异自动配对；如需精确核对明细，建议改选订单号/商品明细作为主键。
+            </div>
+          )}
 
           <div className="stat-grid">
             <button

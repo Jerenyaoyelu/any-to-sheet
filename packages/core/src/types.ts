@@ -118,14 +118,18 @@ export interface TableSummary {
 
 export interface TableRecordRow {
   recordId: string;
-  /** Raw/stringified values keyed by fieldId */
+  /** Display/stringified values keyed by fieldId */
   values: Record<string, unknown>;
+  /** Original host-native values keyed by fieldId (for lossless rollback) */
+  rawValues?: Record<string, unknown>;
 }
 
 export interface TableRecordUpdate {
   recordId: string;
   /** Updated values keyed by fieldId */
   values: Record<string, unknown>;
+  /** Optional host-native values for lossless rollback */
+  rawValues?: Record<string, unknown>;
 }
 
 /**
@@ -141,7 +145,12 @@ export interface HostAdapter {
   readTableRecords?(
     tableId?: string,
     limit?: number
-  ): Promise<{ schema: TableSchema; records: TableRecordRow[] }>;
+  ): Promise<{
+    schema: TableSchema;
+    records: TableRecordRow[];
+    totalCount?: number;
+    truncated?: boolean;
+  }>;
   updateTableRecords?(
     schema: TableSchema,
     updates: TableRecordUpdate[]

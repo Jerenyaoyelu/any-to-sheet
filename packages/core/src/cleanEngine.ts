@@ -75,16 +75,16 @@ export const BUILTIN_CLEAN_PRESETS: Array<{
   {
     id: 'extract_phone',
     label: '提取手机号',
-    description: '从混合姓名/地址文本中提取 11 位大陆手机号',
+    description: '从混合姓名/地址文本中精准提取 11 位大陆手机号',
     plan: {
-      summary: '提取 11 位中国大陆手机号',
+      summary: '提取 11 位中国大陆手机号（自动避开订单号/身份证）',
       steps: [{ op: 'toHalfWidth' }, { op: 'extractPhone' }],
     },
   },
   {
     id: 'extract_number',
     label: '提取纯数字',
-    description: '去掉 ¥、元、逗号和单位，保留纯数值',
+    description: '去掉 ¥、元、逗号和单位，支持万/千换算',
     plan: {
       summary: '去除货币符号与分隔符，保留标准数字',
       steps: [{ op: 'toHalfWidth' }, { op: 'extractNumber' }],
@@ -93,15 +93,15 @@ export const BUILTIN_CLEAN_PRESETS: Array<{
   {
     id: 'remove_brackets',
     label: '去除括号备注',
-    description: '清理中英文括号及括号内附注，如“公司A（待核对）”',
+    description: '清理 ()、（）、【】、[] 括号及内部附注并去多余空格',
     plan: {
-      summary: '移除中英文括号及内部备注文本',
-      steps: [{ op: 'removeBrackets' }, { op: 'normalizeWhitespace' }, { op: 'trim' }],
+      summary: '移除各类括号及内部备注并清理多余空格',
+      steps: [{ op: 'stripInvisible' }, { op: 'removeBrackets' }, { op: 'normalizeWhitespace' }, { op: 'trim' }],
     },
   },
 ];
 
-function toHalfWidth(str: string): string {
+export function toHalfWidth(str: string): string {
   let out = '';
   for (let i = 0; i < str.length; i++) {
     const code = str.charCodeAt(i);
@@ -116,14 +116,160 @@ function toHalfWidth(str: string): string {
   return out;
 }
 
+/** Rejects nested quantifiers / catastrophic backtracking patterns (ReDoS guard) */
+function isUnsafeRegexPattern(pattern: string): boolean {
+  if (!pattern || pattern.length > 200) return true;
+  // Detect obvious nested quantifiers like (a+)+, (\w+\s*)+, (.*)*, ([a-z]+){2,}
+  if (/\([^)]*[+*][^)]*\)[+*{]/.test(pattern)) return true;
+  if (/\([^)]*\|[^)]*\)[+*{]/.test(pattern) && pattern.length > 40) return true;
+  return false;
+}
+
 function safeRegExp(pattern: string, flags = 'g'): RegExp | null {
-  if (!pattern || pattern.length > 200) return null;
+  if (isUnsafeRegexPattern(pattern)) return null;
   const safeFlags = flags.replace(/[^gimsu]/g, '');
   try {
     return new RegExp(pattern, safeFlags);
   } catch {
     return null;
   }
+}
+
+const SIMPLE_OPS = new Set([
+  'trim',
+  'stripInvisible',
+  'normalizeWhitespace',
+  'toHalfWidth',
+  'normalizeDate',
+  'extractPhone',
+  'extractNumber',
+  'removeBrackets',
+]);
+
+/**
+ * Strictly validates and sanitizes AI-returned cleaning steps before returning to clients
+ * or charging user quota.
+ */
+export function sanitizeCleanRuleSteps(raw: unknown): CleanRuleStep[] {
+  if (!Array.isArray(raw)) return [];
+  const valid: CleanRuleStep[] = [];
+
+  for (const item of raw.slice(0, 15)) {
+    if (!item || typeof item !== 'object') continue;
+    const obj = item as Record<string, unknown>;
+    const op = obj.op;
+    if (typeof op !== 'string') continue;
+
+    if (SIMPLE_OPS.has(op)) {
+      valid.push({ op } as CleanRuleStep);
+      continue;
+    }
+
+    if (op === 'case' && (obj.mode === 'upper' || obj.mode === 'lower')) {
+      valid.push({ op: 'case', mode: obj.mode });
+      continue;
+    }
+
+    if (op === 'regexReplace' && typeof obj.pattern === 'string') {
+      const re = safeRegExp(obj.pattern, typeof obj.flags === 'string' ? obj.flags : 'g');
+      if (re) {
+        valid.push({
+          op: 'regexReplace',
+          pattern: obj.pattern,
+          flags: typeof obj.flags === 'string' ? obj.flags.replace(/[^gimsu]/g, '') : 'g',
+          replacement: typeof obj.replacement === 'string' ? obj.replacement.slice(0, 200) : '',
+        });
+      }
+      continue;
+    }
+
+    if (op === 'regexExtract' && typeof obj.pattern === 'string') {
+      const re = safeRegExp(obj.pattern, typeof obj.flags === 'string' ? obj.flags.replace(/g/g, '') : '');
+      if (re) {
+        valid.push({
+          op: 'regexExtract',
+          pattern: obj.pattern,
+          flags: typeof obj.flags === 'string' ? obj.flags.replace(/[^imsu]/g, '') : '',
+          group: typeof obj.group === 'number' && Number.isInteger(obj.group) && obj.group >= 0 ? obj.group : 0,
+        });
+      }
+      continue;
+    }
+
+    if (
+      op === 'splitPick' &&
+      typeof obj.delimiter === 'string' &&
+      obj.delimiter.length > 0 &&
+      typeof obj.index === 'number' &&
+      Number.isInteger(obj.index)
+    ) {
+      valid.push({ op: 'splitPick', delimiter: obj.delimiter.slice(0, 20), index: obj.index });
+      continue;
+    }
+
+    if (op === 'prefixSuffix') {
+      const step: Extract<CleanRuleStep, { op: 'prefixSuffix' }> = { op: 'prefixSuffix' };
+      if (typeof obj.addPrefix === 'string') step.addPrefix = obj.addPrefix.slice(0, 60);
+      if (typeof obj.addSuffix === 'string') step.addSuffix = obj.addSuffix.slice(0, 60);
+      if (typeof obj.stripPrefix === 'string') step.stripPrefix = obj.stripPrefix.slice(0, 60);
+      if (typeof obj.stripSuffix === 'string') step.stripSuffix = obj.stripSuffix.slice(0, 60);
+      if (step.addPrefix || step.addSuffix || step.stripPrefix || step.stripSuffix) {
+        valid.push(step);
+      }
+      continue;
+    }
+
+    if (op === 'valueMap' && obj.mapping && typeof obj.mapping === 'object') {
+      const mapping: Record<string, string> = {};
+      for (const [k, v] of Object.entries(obj.mapping as Record<string, unknown>).slice(0, 100)) {
+        if (k && typeof v === 'string') {
+          mapping[k.slice(0, 120)] = v.slice(0, 200);
+        }
+      }
+      if (Object.keys(mapping).length > 0) {
+        valid.push({
+          op: 'valueMap',
+          mapping,
+          mode: obj.mode === 'contains' ? 'contains' : 'exact',
+        });
+      }
+    }
+  }
+
+  return valid;
+}
+
+function stripAllBrackets(input: string): string {
+  let prev = input;
+  for (let i = 0; i < 4; i++) {
+    const next = prev.replace(/[（(【\[][^（）()【\]\[]*[）)】\]]/g, '');
+    if (next === prev) break;
+    prev = next;
+  }
+  return prev;
+}
+
+function extractSmartNumber(input: string): string | null {
+  const direct = parseNumberValue(input);
+  if (direct.value !== null) return String(direct.value);
+
+  const cleaned = input.replace(/[,，]/g, '');
+  // 1. Prefer number immediately after currency symbol or with 万/千/亿 unit
+  const currencyMatch = cleaned.match(/[¥￥$]\s*(-?\d+(?:\.\d+)?)\s*([万千亿])?/);
+  const unitMatch = cleaned.match(/(?<![A-Za-z0-9-])(-?\d+(?:\.\d+)?)\s*([万千亿])/);
+  const plainMatch = cleaned.match(/(?<![A-Za-z0-9-])(\d+(?:\.\d+)?)/);
+
+  const m = currencyMatch || unitMatch || plainMatch;
+  if (!m) return null;
+
+  let num = Number(m[1]);
+  if (!Number.isFinite(num)) return null;
+  const unit = m[2];
+  if (unit === '千') num *= 1e3;
+  else if (unit === '万') num *= 1e4;
+  else if (unit === '亿') num *= 1e8;
+
+  return String(Number(num.toFixed(6)));
 }
 
 /**
@@ -139,7 +285,8 @@ export function applyCleanSteps(rawInput: string, steps: CleanRuleStep[]): strin
         val = val.trim();
         break;
       case 'stripInvisible':
-        val = val.replace(/[\u200B-\u200F\uFEFF\u00A0\u202A-\u202E]/g, '');
+        // Replace NBSP (\u00A0) with normal space so English words don't glue together
+        val = val.replace(/\u00A0/g, ' ').replace(/[\u200B-\u200F\uFEFF\u202A-\u202E]/g, '');
         break;
       case 'normalizeWhitespace':
         val = val.replace(/[ \t\r\n]+/g, ' ').trim();
@@ -153,25 +300,22 @@ export function applyCleanSteps(rawInput: string, steps: CleanRuleStep[]): strin
         break;
       }
       case 'extractPhone': {
-        const m = val.replace(/[\s-]/g, '').match(/1[3-9]\d{9}/);
-        if (m) val = m[0];
+        // Normalize phone separators inside candidate digits without gluing unrelated adjacent numbers
+        const compact = val.replace(/(\d)[\s-]+(?=\d)/g, '$1');
+        const m = compact.match(/(?<!\d)(?:\+?86)?(1[3-9]\d{9})(?!\d)/);
+        if (m) val = m[1];
         break;
       }
       case 'extractNumber': {
-        const direct = parseNumberValue(val);
-        if (direct.value !== null) {
-          val = String(direct.value);
-        } else {
-          const m = val.replace(/[,，]/g, '').match(/-?\d+(?:\.\d+)?/);
-          if (m) val = m[0];
-        }
+        const extracted = extractSmartNumber(val);
+        if (extracted !== null) val = extracted;
         break;
       }
       case 'case':
         val = step.mode === 'upper' ? val.toUpperCase() : val.toLowerCase();
         break;
       case 'removeBrackets':
-        val = val.replace(/[（(][^）)]*[）)]/g, '');
+        val = stripAllBrackets(val);
         break;
       case 'regexReplace': {
         const re = safeRegExp(step.pattern, step.flags ?? 'g');
@@ -215,7 +359,8 @@ export function applyCleanSteps(rawInput: string, steps: CleanRuleStep[]): strin
         break;
       }
       case 'valueMap': {
-        const entries = Object.entries(step.mapping || {});
+        // Sort longest keys first so specific names match before shorter substrings
+        const entries = Object.entries(step.mapping || {}).sort((a, b) => b[0].length - a[0].length);
         const mode = step.mode || 'exact';
         for (const [from, to] of entries) {
           if (!from) continue;
@@ -239,6 +384,9 @@ export function applyCleanSteps(rawInput: string, steps: CleanRuleStep[]): strin
 }
 
 function coerceAfterValue(field: FieldSchema, afterText: string): unknown {
+  if (afterText === '') {
+    return field.type === 'multiSelect' ? [] : '';
+  }
   if (field.type === 'number') {
     const parsed = parseNumberValue(afterText);
     return parsed.value !== null ? parsed.value : afterText;
@@ -285,6 +433,7 @@ export function computeCleanDiff(
       rollbackUpdates.push({
         recordId: rec.recordId,
         values: { [field.id]: rawVal },
+        rawValues: rec.rawValues ? { [field.id]: rec.rawValues[field.id] } : undefined,
       });
     }
   }

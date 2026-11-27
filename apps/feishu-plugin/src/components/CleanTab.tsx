@@ -12,11 +12,72 @@ import {
   type UserIdentity,
 } from '@table-ai/core';
 
+const FIELD_TYPE_ZH: Record<string, string> = {
+  text: '文本',
+  number: '数字',
+  date: '日期',
+  singleSelect: '单选',
+  multiSelect: '多选',
+  checkbox: '复选',
+  phone: '电话',
+  url: '链接',
+  email: '邮箱',
+};
+
 interface CleanTabProps {
   adapter: HostAdapter | null;
   schema: TableSchema | null;
   identity: UserIdentity | null;
   onQuotaUpdate: (quota: QuotaSnapshot) => void;
+  onNeedRedeem: () => void;
+}
+
+async function safeParseJson(res: Response): Promise<Record<string, unknown>> {
+  const text = await res.text();
+  try {
+    return JSON.parse(text) as Record<string, unknown>;
+  } catch {
+    return { error: `服务端返回异常 (${res.status})：${text.slice(0, 120)}` };
+  }
+}
+
+/** Makes leading/trailing spaces and zero-width characters visible in Git Diff */
+function renderVisibleWhitespace(str: string): React.ReactNode {
+  if (!str) return <em className="muted">（空）</em>;
+  const leadMatch = str.match(/^[ \u00A0]+/);
+  const trailMatch = str.match(/[ \u00A0]+$/);
+  const leadLen = leadMatch ? leadMatch[0].length : 0;
+  const trailLen = trailMatch && leadLen < str.length ? trailMatch[0].length : 0;
+  const middle = str.slice(leadLen, str.length - trailLen);
+
+  const parts: React.ReactNode[] = [];
+  if (leadLen > 0) {
+    parts.push(
+      <span key="lead" className="ws-marker" title={`前导空格 ×${leadLen}`}>
+        {'␣'.repeat(leadLen)}
+      </span>
+    );
+  }
+  const midWithZw = middle.split(/([\u200B-\u200F\uFEFF\u202A-\u202E])/);
+  midWithZw.forEach((seg, idx) => {
+    if (/^[\u200B-\u200F\uFEFF\u202A-\u202E]$/.test(seg)) {
+      parts.push(
+        <span key={`zw-${idx}`} className="ws-marker" title="零宽不可见字符">
+          [隐]
+        </span>
+      );
+    } else if (seg) {
+      parts.push(seg);
+    }
+  });
+  if (trailLen > 0) {
+    parts.push(
+      <span key="trail" className="ws-marker" title={`尾随空格 ×${trailLen}`}>
+        {'␣'.repeat(trailLen)}
+      </span>
+    );
+  }
+  return parts;
 }
 
 export default function CleanTab({
@@ -24,14 +85,22 @@ export default function CleanTab({
   schema,
   identity,
   onQuotaUpdate,
+  onNeedRedeem,
 }: CleanTabProps) {
   const writableFields = useMemo(
     () => schema?.fields.filter((f) => !f.readonly && f.type !== 'unknown') ?? [],
     [schema]
   );
 
+  const schemaSig = useMemo(
+    () => `${schema?.tableId || ''}::${writableFields.map((f) => f.id).join(',')}`,
+    [schema?.tableId, writableFields]
+  );
+
   const [selectedFieldId, setSelectedFieldId] = useState('');
   const [records, setRecords] = useState<TableRecordRow[]>([]);
+  const [totalCount, setTotalCount] = useState(0);
+  const [truncated, setTruncated] = useState(false);
   const [loadingRows, setLoadingRows] = useState(false);
 
   const [instruction, setInstruction] = useState('');
@@ -52,7 +121,6 @@ export default function CleanTab({
     null
   );
 
-  // Sync default field & load live records when table changes
   useEffect(() => {
     if (!schema || !adapter?.readTableRecords) return;
     const firstId = writableFields[0]?.id || '';
@@ -66,9 +134,12 @@ export default function CleanTab({
     let cancelled = false;
     setLoadingRows(true);
     adapter
-      .readTableRecords(schema.tableId, 200)
+      .readTableRecords(schema.tableId, 500)
       .then((res) => {
-        if (!cancelled) setRecords(res.records);
+        if (cancelled) return;
+        setRecords(res.records);
+        setTotalCount(res.totalCount ?? res.records.length);
+        setTruncated(Boolean(res.truncated));
       })
       .catch((err) => {
         if (!cancelled) {
@@ -85,22 +156,31 @@ export default function CleanTab({
     return () => {
       cancelled = true;
     };
-  }, [adapter, schema?.tableId]);
+  }, [adapter, schemaSig]);
 
   const targetField = useMemo(
     () => writableFields.find((f) => f.id === selectedFieldId) || null,
     [writableFields, selectedFieldId]
   );
 
+  // Only show rollback bar when viewing the exact same table that was cleaned
+  const activeRollback =
+    lastRollback && schema && lastRollback.schema.tableId === schema.tableId ? lastRollback : null;
+
   async function reloadRecords() {
     if (!adapter?.readTableRecords || !schema) return;
     setLoadingRows(true);
     try {
-      const res = await adapter.readTableRecords(schema.tableId, 200);
+      const res = await adapter.readTableRecords(schema.tableId, 500);
       setRecords(res.records);
+      setTotalCount(res.totalCount ?? res.records.length);
+      setTruncated(Boolean(res.truncated));
       setPreview(null);
       setActivePlan(null);
-      setNotice({ type: 'info', text: `已重新加载「${schema.tableName}」共 ${res.records.length} 行数据。` });
+      setNotice({
+        type: 'info',
+        text: `已重新加载「${schema.tableName}」共 ${res.records.length} 行数据。`,
+      });
     } catch (err) {
       setNotice({
         type: 'error',
@@ -120,12 +200,12 @@ export default function CleanTab({
     if (result.changedCount === 0) {
       setNotice({
         type: 'info',
-        text: `已扫描 ${result.totalScanned} 行，「${targetField.name}」列无需改动（数据已经很干净，或可换个规则描述）。`,
+        text: `已扫描 ${result.totalScanned} 行，「${targetField.name}」列无需改动（数据已规范，或可尝试其他规则）。`,
       });
     } else {
       setNotice({
         type: 'info',
-        text: `规则预览完成：共扫描 ${result.totalScanned} 行，将修改 ${result.changedCount} 个单元格。核对 Diff 后点击下方写入。`,
+        text: `规则预览完成：共扫描 ${result.totalScanned} 行，发现 ${result.changedCount} 处可清洗项。核对 Diff 后一键写入。`,
       });
     }
   }
@@ -155,9 +235,14 @@ export default function CleanTab({
           instruction: instruction.trim(),
         }),
       });
-      const data = await res.json();
+      const data = await safeParseJson(res);
       if (data.quota) onQuotaUpdate(data.quota as QuotaSnapshot);
-      if (!res.ok) throw new Error(data.error || '生成清洗规则失败');
+      if (!res.ok) {
+        if (res.status === 402 || res.status === 403 || res.status === 429) {
+          onNeedRedeem();
+        }
+        throw new Error(String(data.error || '生成清洗规则失败'));
+      }
 
       const plan = data.plan as CleanRulePlan;
       runPlanPreview(plan);
@@ -193,17 +278,18 @@ export default function CleanTab({
         summary: activePlan?.summary || '上次清洗',
       });
 
-      // Refresh local cached records so subsequent cleanups see updated data
       if (adapter.readTableRecords) {
-        const fresh = await adapter.readTableRecords(schema.tableId, 200);
+        const fresh = await adapter.readTableRecords(schema.tableId, 500);
         setRecords(fresh.records);
+        setTotalCount(fresh.totalCount ?? fresh.records.length);
+        setTruncated(Boolean(fresh.truncated));
       }
 
       setPreview(null);
       setActivePlan(null);
       setNotice({
         type: 'success',
-        text: `清洗完成！已批量更新 ${updatedCount} 条记录。如需恢复原值，可随时点击下方「一键撤回」。`,
+        text: `清洗完成！已批量更新 ${updatedCount} 条记录。如需恢复原值，可点击上方「一键撤回」。`,
       });
     } catch (err) {
       setNotice({
@@ -216,22 +302,22 @@ export default function CleanTab({
   }
 
   async function handleRollback() {
-    if (!adapter?.updateTableRecords || !lastRollback) return;
+    if (!adapter?.updateTableRecords || !activeRollback) return;
     setRollingBack(true);
     setNotice(null);
     try {
       const { updatedCount } = await adapter.updateTableRecords(
-        lastRollback.schema,
-        lastRollback.updates
+        activeRollback.schema,
+        activeRollback.updates
       );
       if (adapter.readTableRecords && schema) {
-        const fresh = await adapter.readTableRecords(schema.tableId, 200);
+        const fresh = await adapter.readTableRecords(schema.tableId, 500);
         setRecords(fresh.records);
       }
       setLastRollback(null);
       setNotice({
         type: 'success',
-        text: `已一键撤回 ${updatedCount} 条记录至清洗前原值！`,
+        text: `已一键撤回「${activeRollback.schema.tableName}」的 ${updatedCount} 条记录至清洗前原值！`,
       });
     } catch (err) {
       setNotice({
@@ -247,11 +333,21 @@ export default function CleanTab({
     <div className="tab-stack">
       <section className="card">
         <div className="card-header">
-          <strong>1. 选择要清洗的列</strong>
+          <strong>选择清洗列与规则</strong>
           <button className="btn btn-ghost" disabled={loadingRows} onClick={reloadRecords}>
-            {loadingRows ? '读取中...' : `已加载 ${records.length} 行 · 刷新`}
+            {loadingRows
+              ? '读取中...'
+              : truncated
+                ? `已载入 ${records.length}/${totalCount} 行 · 刷新`
+                : `已载入 ${records.length} 行 · 刷新`}
           </button>
         </div>
+
+        {truncated && (
+          <div className="muted">
+            提示：当前视图共 {totalCount} 行，本次已读取前 {records.length} 行（可先在飞书视图筛选后再清洗）。
+          </div>
+        )}
 
         <select
           className="select"
@@ -264,7 +360,7 @@ export default function CleanTab({
         >
           {writableFields.map((f) => (
             <option key={f.id} value={f.id}>
-              {f.name}（{f.type}）
+              {f.name}（{FIELD_TYPE_ZH[f.type] || f.type}）
             </option>
           ))}
         </select>
@@ -294,7 +390,7 @@ export default function CleanTab({
             <input
               className="hint-input"
               style={{ flex: 1, minWidth: 0 }}
-              placeholder="例如：去掉括号里的备注，并把简称统一成公司全称"
+              placeholder="例如：去掉括号备注并把全角数字改半角"
               value={instruction}
               onChange={(e) => setInstruction(e.target.value)}
             />
@@ -309,14 +405,12 @@ export default function CleanTab({
         </div>
       </section>
 
-      {lastRollback && (
+      {activeRollback && (
         <div className="rollback-bar">
-          <span>上次操作：{lastRollback.summary}（{lastRollback.updates.length} 处）</span>
-          <button
-            className="btn btn-ghost"
-            disabled={rollingBack}
-            onClick={handleRollback}
-          >
+          <span>
+            已修改「{activeRollback.schema.tableName}」{activeRollback.updates.length} 处
+          </span>
+          <button className="btn btn-ghost" disabled={rollingBack} onClick={handleRollback}>
             {rollingBack ? '撤回中...' : '↩️ 一键撤回'}
           </button>
         </div>
@@ -328,7 +422,7 @@ export default function CleanTab({
         <section className="card">
           <div className="card-header">
             <strong>
-              2. Git 式修改预览（{selectedIds.length}/{preview.changedCount} 处将生效）
+              Git 修改预览（{selectedIds.length}/{preview.changedCount} 处将生效）
             </strong>
             <div className="row-actions">
               <button
@@ -346,7 +440,7 @@ export default function CleanTab({
             </div>
           </div>
 
-          {activePlan && <div className="muted">规则说明：{activePlan.summary}</div>}
+          {activePlan && <div className="muted">规则：{activePlan.summary}（␣ 代表空格，[隐] 代表零宽字符）</div>}
 
           <div className="diff-list">
             {preview.diffs.map((item) => {
@@ -359,8 +453,8 @@ export default function CleanTab({
                     onChange={() => toggleDiffItem(item.recordId)}
                   />
                   <div className="diff-body">
-                    <div className="diff-before">- {item.before}</div>
-                    <div className="diff-after">+ {item.after}</div>
+                    <div className="diff-before">- {renderVisibleWhitespace(item.before)}</div>
+                    <div className="diff-after">+ {renderVisibleWhitespace(item.after)}</div>
                   </div>
                 </label>
               );
