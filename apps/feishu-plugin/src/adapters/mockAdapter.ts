@@ -1,7 +1,10 @@
 import type {
   HostAdapter,
   HostAttachmentItem,
+  TableRecordRow,
+  TableRecordUpdate,
   TableSchema,
+  TableSummary,
   UserIdentity,
   ValidatedRow,
 } from '@table-ai/core';
@@ -40,6 +43,18 @@ export const DEMO_SCHEMAS: Record<string, TableSchema> = {
         状态: '待比价',
       },
     ],
+  },
+  erp_bill: {
+    tableId: 'demo_erp_bill',
+    tableName: '财务 ERP 对账结算单（对照表）',
+    fields: [
+      { id: 'e_vendor', name: '商户名称', type: 'text' },
+      { id: 'e_item', name: '品名', type: 'text' },
+      { id: 'e_qty', name: '采购件数', type: 'number' },
+      { id: 'e_total', name: '实付总额', type: 'number' },
+      { id: 'e_date', name: '入账日期', type: 'date' },
+    ],
+    sampleRows: [],
   },
   resume: {
     tableId: 'demo_resume',
@@ -110,6 +125,149 @@ export const DEMO_SCHEMAS: Record<string, TableSchema> = {
   },
 };
 
+function initialDemoRecords(): Record<string, TableRecordRow[]> {
+  return {
+    demo_quote: [
+      {
+        recordId: 'rec_q_1',
+        values: {
+          f_vendor: '  杭州星辰供应链有限公司（已签合同） ',
+          f_item: '定制礼盒外箱 30*20cm',
+          f_qty: 500,
+          f_price: 4.5,
+          f_total: 2250,
+          f_date: '2026/11/8',
+          f_status: '已确认',
+        },
+      },
+      {
+        recordId: 'rec_q_2',
+        values: {
+          f_vendor: '星辰包装\u200B（老王报价）',
+          f_item: '加厚防震气泡袋 M号',
+          f_qty: 1000,
+          f_price: 0.85,
+          f_total: 850,
+          f_date: '2026年11月12日',
+          f_status: '待比价',
+        },
+      },
+      {
+        recordId: 'rec_q_3',
+        values: {
+          f_vendor: '义乌顺达印刷厂  ',
+          f_item: '定制不干胶标签 ５０００张',
+          f_qty: 5000,
+          f_price: 0.12,
+          f_total: 600,
+          f_date: '2026.11.19',
+          f_status: '已确认',
+        },
+      },
+      {
+        recordId: 'rec_q_4',
+        values: {
+          f_vendor: '深圳华强电子配件(急单)',
+          f_item: 'Type-C 快充数据线 1.5m',
+          f_qty: 200,
+          f_price: 6.5,
+          f_total: 1300,
+          f_date: '2026-11-24',
+          f_status: '待比价',
+        },
+      },
+    ],
+    demo_erp_bill: [
+      {
+        recordId: 'rec_e_1',
+        values: {
+          e_vendor: '杭州星辰供应链有限公司',
+          e_item: '定制礼盒外箱 30*20cm',
+          e_qty: 500,
+          e_total: 2250,
+          e_date: '2026-11-08',
+        },
+      },
+      {
+        recordId: 'rec_e_2',
+        values: {
+          e_vendor: '星辰包装',
+          e_item: '加厚防震气泡袋 M号',
+          e_qty: 1000,
+          e_total: 880, // Intentional +30 diff vs quote (850)
+          e_date: '2026-11-12',
+        },
+      },
+      {
+        recordId: 'rec_e_3',
+        values: {
+          e_vendor: '义乌顺达印刷厂',
+          e_item: '定制不干胶标签 5000张',
+          e_qty: 5000,
+          e_total: 600,
+          e_date: '2026-11-19',
+        },
+      },
+      {
+        recordId: 'rec_e_5',
+        values: {
+          e_vendor: '顺丰速运',
+          e_item: '11月样品寄送月结运费',
+          e_qty: 1,
+          e_total: 320,
+          e_date: '2026-11-25',
+        },
+      },
+    ],
+    demo_resume: [
+      {
+        recordId: 'rec_r_1',
+        values: {
+          f_name: '林晓明（内推）',
+          f_phone: '联系：138-6677-8899 杭州',
+          f_exp: 6,
+          f_role: '资深前端工程师',
+          f_edu: '硕士',
+          f_tags: ['React', 'TypeScript', 'AI应用'],
+        },
+      },
+      {
+        recordId: 'rec_r_2',
+        values: {
+          f_name: '  陈思远 ',
+          f_phone: '１３９００１３９０００',
+          f_exp: 4,
+          f_role: '全栈研发工程师',
+          f_edu: '本科',
+          f_tags: ['Node.js', 'TypeScript'],
+        },
+      },
+    ],
+    demo_expense: [
+      {
+        recordId: 'rec_x_1',
+        values: {
+          f_merchant: '滴滴出行科技有限公司 ',
+          f_date: '2026/11/22',
+          f_amount: 148.6,
+          f_cat: '差旅交通',
+          f_remark: '杭州东站客户拜访往返',
+        },
+      },
+      {
+        recordId: 'rec_x_2',
+        values: {
+          f_merchant: '火山引擎（云计算）',
+          f_date: '2026年11月25日',
+          f_amount: 200,
+          f_cat: '云服务/软件',
+          f_remark: 'Doubao Seed API 充值',
+        },
+      },
+    ],
+  };
+}
+
 function createDemoDocumentImage(fileName: string, lines: string[]): Promise<File> {
   return new Promise((resolve) => {
     const canvas = document.createElement('canvas');
@@ -145,6 +303,7 @@ function createDemoDocumentImage(fileName: string, lines: string[]): Promise<Fil
 export class MockHostAdapter implements HostAdapter {
   readonly hostName = '本地浏览器模拟模式（脱离飞书可直接演示）';
   private activeKey: keyof typeof DEMO_SCHEMAS = 'quote';
+  private recordsByTable: Record<string, TableRecordRow[]> = initialDemoRecords();
   public writtenHistory: ValidatedRow[] = [];
 
   setDemoSchema(key: keyof typeof DEMO_SCHEMAS) {
@@ -165,8 +324,50 @@ export class MockHostAdapter implements HostAdapter {
     return { userId: uid, tenantKey: 'mock_tenant' };
   }
 
-  async getActiveTableSchema(): Promise<TableSchema> {
+  async getActiveTableSchema(preferredTableId?: string): Promise<TableSchema> {
+    if (preferredTableId) {
+      const found = Object.values(DEMO_SCHEMAS).find((s) => s.tableId === preferredTableId);
+      if (found) return found;
+    }
     return DEMO_SCHEMAS[this.activeKey];
+  }
+
+  async listTables(): Promise<TableSummary[]> {
+    return Object.values(DEMO_SCHEMAS).map((s) => ({
+      tableId: s.tableId,
+      tableName: s.tableName,
+    }));
+  }
+
+  async readTableRecords(
+    tableId?: string,
+    limit = 200
+  ): Promise<{ schema: TableSchema; records: TableRecordRow[] }> {
+    const schema = await this.getActiveTableSchema(tableId);
+    const list = this.recordsByTable[schema.tableId] || [];
+    return {
+      schema,
+      records: list.slice(0, limit).map((r) => ({
+        recordId: r.recordId,
+        values: { ...r.values },
+      })),
+    };
+  }
+
+  async updateTableRecords(
+    schema: TableSchema,
+    updates: TableRecordUpdate[]
+  ): Promise<{ updatedCount: number }> {
+    const list = this.recordsByTable[schema.tableId] || [];
+    let updatedCount = 0;
+    for (const u of updates) {
+      const target = list.find((r) => r.recordId === u.recordId);
+      if (target) {
+        Object.assign(target.values, u.values);
+        updatedCount++;
+      }
+    }
+    return { updatedCount };
   }
 
   async readAttachmentsFromField(_fieldId: string): Promise<HostAttachmentItem[]> {
@@ -227,10 +428,22 @@ export class MockHostAdapter implements HostAdapter {
   }
 
   async writeValidatedRows(
-    _schema: TableSchema,
+    schema: TableSchema,
     rows: ValidatedRow[]
   ): Promise<{ writtenCount: number }> {
     this.writtenHistory.push(...rows);
+    const list = this.recordsByTable[schema.tableId] || [];
+    rows.forEach((row, idx) => {
+      const values: Record<string, unknown> = {};
+      for (const [fid, cell] of Object.entries(row.cells)) {
+        values[fid] = cell.value;
+      }
+      list.push({
+        recordId: `rec_new_${Date.now()}_${idx}`,
+        values,
+      });
+    });
+    this.recordsByTable[schema.tableId] = list;
     return { writtenCount: rows.length };
   }
 }

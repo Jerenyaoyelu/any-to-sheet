@@ -111,6 +111,23 @@ export interface ExtractResponse {
   };
 }
 
+export interface TableSummary {
+  tableId: string;
+  tableName: string;
+}
+
+export interface TableRecordRow {
+  recordId: string;
+  /** Raw/stringified values keyed by fieldId */
+  values: Record<string, unknown>;
+}
+
+export interface TableRecordUpdate {
+  recordId: string;
+  /** Updated values keyed by fieldId */
+  values: Record<string, unknown>;
+}
+
 /**
  * HostAdapter decouples business logic from specific spreadsheet hosts.
  * Phase 1: FeishuHostAdapter (and MockHostAdapter for standalone browser dev)
@@ -119,7 +136,16 @@ export interface ExtractResponse {
 export interface HostAdapter {
   readonly hostName: string;
   getUserIdentity?(): Promise<UserIdentity>;
-  getActiveTableSchema(): Promise<TableSchema>;
+  getActiveTableSchema(preferredTableId?: string): Promise<TableSchema>;
+  listTables?(): Promise<TableSummary[]>;
+  readTableRecords?(
+    tableId?: string,
+    limit?: number
+  ): Promise<{ schema: TableSchema; records: TableRecordRow[] }>;
+  updateTableRecords?(
+    schema: TableSchema,
+    updates: TableRecordUpdate[]
+  ): Promise<{ updatedCount: number }>;
   readAttachmentsFromField?(fieldId: string): Promise<HostAttachmentItem[]>;
   writeValidatedRows(schema: TableSchema, rows: ValidatedRow[]): Promise<{ writtenCount: number }>;
 }

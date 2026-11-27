@@ -18,7 +18,10 @@ import {
   type HostAttachmentItem,
   type NormalizedFieldType,
   type SelectOption,
+  type TableRecordRow,
+  type TableRecordUpdate,
   type TableSchema,
+  type TableSummary,
   type UserIdentity,
   type ValidatedRow,
 } from '@table-ai/core';
@@ -260,6 +263,108 @@ export class FeishuHostAdapter implements HostAdapter {
       attachmentFields,
       sampleRows,
     };
+  }
+
+  async listTables(): Promise<TableSummary[]> {
+    const metaList = await bitable.base.getTableMetaList();
+    return metaList.map((m) => ({ tableId: m.id, tableName: m.name }));
+  }
+
+  async readTableRecords(
+    tableId?: string,
+    limit = 200
+  ): Promise<{ schema: TableSchema; records: TableRecordRow[] }> {
+    const schema = await this.getActiveTableSchema(tableId);
+    const { table } = await resolveCurrentTable(schema.tableId);
+    const writable = schema.fields.filter((f) => !f.readonly && f.type !== 'unknown');
+    const recordIds = (await table.getRecordIdList()).slice(0, limit);
+
+    const records: TableRecordRow[] = [];
+    for (const rid of recordIds) {
+      const values: Record<string, unknown> = {};
+      for (const f of writable) {
+        try {
+          const textVal = await table.getCellString(f.id, rid);
+          values[f.id] = textVal ?? '';
+        } catch {
+          values[f.id] = '';
+        }
+      }
+      records.push({ recordId: rid, values });
+    }
+
+    return { schema, records };
+  }
+
+  async updateTableRecords(
+    schema: TableSchema,
+    updates: TableRecordUpdate[]
+  ): Promise<{ updatedCount: number }> {
+    if (updates.length === 0) return { updatedCount: 0 };
+    const table = schema.tableId
+      ? await bitable.base.getTableById(schema.tableId)
+      : (await resolveCurrentTable()).table;
+
+    const fieldMap = new Map(schema.fields.map((f) => [f.id, f]));
+    const latestOptionsMap = new Map<string, SelectOption[]>();
+
+    for (const field of schema.fields) {
+      if (field.readonly || (field.type !== 'singleSelect' && field.type !== 'multiSelect')) {
+        continue;
+      }
+      const existingOpts = field.options ? [...field.options] : [];
+      const missingNames = new Set<string>();
+      for (const u of updates) {
+        if (!(field.id in u.values)) continue;
+        const val = u.values[field.id];
+        if (val === null || val === undefined || val === '') continue;
+        const candidates =
+          field.type === 'multiSelect'
+            ? splitMultiSelectValues(val)
+            : [String(val).trim()].filter(Boolean);
+        for (const name of candidates) {
+          if (!findOption(existingOpts, name)) missingNames.add(name);
+        }
+      }
+      if (missingNames.size > 0) {
+        try {
+          const selectField = await table.getField<ISingleSelectField | IMultiSelectField>(field.id);
+          await selectField.addOptions(Array.from(missingNames).map((name) => ({ name })));
+          const refreshed = await selectField.getOptions();
+          latestOptionsMap.set(
+            field.id,
+            refreshed.map((o) => ({ id: o.id, name: o.name }))
+          );
+        } catch {
+          latestOptionsMap.set(field.id, existingOpts);
+        }
+      } else {
+        latestOptionsMap.set(field.id, existingOpts);
+      }
+    }
+
+    const payload = updates.map((u) => {
+      const fieldsPayload: Record<string, IOpenCellValue> = {};
+      for (const [fieldId, val] of Object.entries(u.values)) {
+        const field = fieldMap.get(fieldId);
+        if (!field || field.readonly) continue;
+        const formatted = toFeishuCellValue(field, val, latestOptionsMap.get(fieldId));
+        if (formatted !== undefined) {
+          fieldsPayload[fieldId] = formatted;
+        }
+      }
+      return { recordId: u.recordId, fields: fieldsPayload };
+    });
+
+    const BATCH_SIZE = 200;
+    let updatedCount = 0;
+    for (let i = 0; i < payload.length; i += BATCH_SIZE) {
+      const batch = payload.slice(i, i + BATCH_SIZE);
+      await table.setRecords(batch);
+      updatedCount += batch.length;
+    }
+
+    return { updatedCount };
   }
 
   /**

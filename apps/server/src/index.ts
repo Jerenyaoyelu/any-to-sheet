@@ -6,8 +6,11 @@ import express from 'express';
 import cors from 'cors';
 import multer from 'multer';
 import {
+  buildCleanRulePrompt,
   buildExtractionPrompt,
+  suggestReconcileMapping,
   validateExtractionItems,
+  type CleanRulePlan,
   type ExtractionRawItem,
   type ExtractResponse,
   type TableSchema,
@@ -204,6 +207,31 @@ function parseModelItems(raw: string): { items: ExtractionRawItem[] } {
     searchFrom = start + 1;
   }
   throw new Error('大模型返回的内容无法解析成提取结果，请重试一次');
+}
+
+function parseFirstJsonObject<T>(raw: string): T | null {
+  let text = raw.trim();
+  const fenced = text.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
+  if (fenced?.[1]) text = fenced[1].trim();
+
+  let searchFrom = 0;
+  while (searchFrom < text.length) {
+    const idx = text.indexOf('{', searchFrom);
+    if (idx === -1) break;
+    const slice = sliceFirstJsonValue(text, idx);
+    if (!slice) {
+      searchFrom = idx + 1;
+      continue;
+    }
+    try {
+      const parsed = JSON.parse(slice) as T;
+      if (parsed && typeof parsed === 'object') return parsed;
+    } catch {
+      // Keep scanning for a valid JSON object
+    }
+    searchFrom = idx + 1;
+  }
+  return null;
 }
 
 function parseAndValidateSchema(raw: unknown): TableSchema | null {
@@ -800,6 +828,263 @@ app.post('/api/extract', upload.array('files', 25), async (req, res) => {
     const message = err instanceof Error ? err.message : '未知提取错误';
     console.error('[extract error]', err);
     res.status(500).json({ error: message });
+  }
+});
+
+app.post('/api/clean-rules', async (req, res) => {
+  let reservationId: string | null = null;
+  let reservedUserId = '';
+  let reservedTier: 'free' | 'pro' = 'free';
+  let chosenModel = runtimeConfig.getEffective().freeModel;
+
+  try {
+    const clientIp = getClientIp(req);
+    const ipCheck = quotaStore.checkIpRateLimit(clientIp, 'clean_rules', 12);
+    if (!ipCheck.allowed) {
+      res.status(429).json({ error: `请求过于频繁，请 ${ipCheck.retryAfterSec} 秒后再试` });
+      return;
+    }
+
+    const fieldName = typeof req.body?.fieldName === 'string' ? req.body.fieldName.trim() : '';
+    const fieldType = typeof req.body?.fieldType === 'string' ? req.body.fieldType.trim() : 'text';
+    const instruction = typeof req.body?.instruction === 'string' ? req.body.instruction.trim() : '';
+    const samples: string[] = Array.isArray(req.body?.samples)
+      ? req.body.samples.map((x: unknown) => String(x ?? '')).filter(Boolean).slice(0, 20)
+      : [];
+
+    if (!fieldName || !instruction) {
+      res.status(400).json({ error: '请提供目标列名和清洗要求' });
+      return;
+    }
+
+    const { userId, tenantKey } = getUserHeaders(req);
+    const reserveRes = quotaStore.reserve(userId, 1, tenantKey, clientIp);
+    if (!reserveRes.allowed) {
+      res.status(reserveRes.statusCode).json({
+        error: reserveRes.error,
+        quota: reserveRes.snapshot,
+      });
+      return;
+    }
+
+    reservationId = reserveRes.reservation.id;
+    reservedUserId = reserveRes.reservation.userId;
+    reservedTier = reserveRes.reservation.plan.useProModel ? 'pro' : 'free';
+
+    const llm = runtimeConfig.getEffective();
+    chosenModel = reserveRes.reservation.plan.useProModel ? llm.proModel : llm.freeModel;
+
+    let plan: CleanRulePlan;
+    let mode: 'llm' | 'mock' = 'mock';
+    let promptTokens = 0;
+    let completionTokens = 0;
+
+    if (llm.apiKey) {
+      mode = 'llm';
+      const baseUrl = await assertPublicHttpsBaseUrl(llm.baseUrl);
+      const { systemPrompt, userPrompt } = buildCleanRulePrompt(
+        fieldName,
+        fieldType,
+        samples,
+        instruction
+      );
+
+      const response = await fetch(`${baseUrl}/chat/completions`, {
+        method: 'POST',
+        signal: AbortSignal.timeout(45000),
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${llm.apiKey}`,
+        },
+        body: JSON.stringify({
+          model: chosenModel,
+          temperature: 0.1,
+          messages: [
+            { role: 'system', content: systemPrompt },
+            { role: 'user', content: userPrompt },
+          ],
+        }),
+      });
+
+      if (!response.ok) {
+        const errText = await response.text();
+        throw new Error(`LLM API 调用失败 (${response.status}): ${errText.slice(0, 240)}`);
+      }
+
+      const data = (await response.json()) as {
+        choices?: Array<{ message?: { content?: string } }>;
+        usage?: { prompt_tokens?: number; completion_tokens?: number };
+      };
+      const rawContent = data.choices?.[0]?.message?.content;
+      if (!rawContent) throw new Error('大模型未返回有效清洗规则');
+
+      const parsed = parseFirstJsonObject<Partial<CleanRulePlan>>(rawContent);
+      if (!parsed || !Array.isArray(parsed.steps) || parsed.steps.length === 0) {
+        throw new Error('大模型未生成有效清洗步骤，请尝试更具体地描述需求');
+      }
+      plan = {
+        summary:
+          typeof parsed.summary === 'string' && parsed.summary.trim()
+            ? parsed.summary.trim()
+            : instruction,
+        steps: parsed.steps,
+      };
+      promptTokens = data.usage?.prompt_tokens ?? 0;
+      completionTokens = data.usage?.completion_tokens ?? 0;
+    } else {
+      const steps: CleanRulePlan['steps'] = [{ op: 'stripInvisible' }, { op: 'toHalfWidth' }, { op: 'trim' }];
+      if (/日期|date/i.test(instruction)) steps.push({ op: 'normalizeDate' });
+      else if (/手机|电话|phone/i.test(instruction)) steps.push({ op: 'extractPhone' });
+      else if (/数字|金额|单价/i.test(instruction)) steps.push({ op: 'extractNumber' });
+      else if (/括号|备注/i.test(instruction)) steps.push({ op: 'removeBrackets' }, { op: 'trim' });
+      else if (/大写/i.test(instruction)) steps.push({ op: 'case', mode: 'upper' });
+      else if (/小写/i.test(instruction)) steps.push({ op: 'case', mode: 'lower' });
+      else steps.push({ op: 'normalizeWhitespace' });
+
+      plan = {
+        summary: `演示模式规则：${instruction}`,
+        steps,
+      };
+    }
+
+    const updatedQuota = quotaStore.commit(reservationId);
+    reservationId = null;
+
+    const estimatedCostCny =
+      mode === 'llm' ? estimateModelCostCny(chosenModel, promptTokens, completionTokens) : 0;
+
+    quotaStore.recordLog({
+      userId: reservedUserId,
+      tier: reservedTier,
+      mode,
+      model: mode === 'llm' ? chosenModel : 'mock-demo',
+      pages: 1,
+      rowsExtracted: plan.steps.length,
+      estimatedCostCny,
+      status: 'ok',
+    });
+
+    res.json({
+      ok: true,
+      mode,
+      model: mode === 'llm' ? chosenModel : 'mock-demo',
+      plan,
+      estimatedCostCny,
+      quota: updatedQuota,
+    });
+  } catch (err) {
+    if (reservationId) {
+      quotaStore.release(reservationId);
+    }
+    const message = err instanceof Error ? err.message : '生成清洗规则失败';
+    res.status(500).json({ error: message });
+  }
+});
+
+app.post('/api/reconcile-suggest', async (req, res) => {
+  try {
+    const clientIp = getClientIp(req);
+    const ipCheck = quotaStore.checkIpRateLimit(clientIp, 'reconcile_suggest', 12);
+    if (!ipCheck.allowed) {
+      res.status(429).json({ error: `请求过于频繁，请 ${ipCheck.retryAfterSec} 秒后再试` });
+      return;
+    }
+
+    const leftHeaders: string[] = Array.isArray(req.body?.leftHeaders)
+      ? req.body.leftHeaders.map(String).slice(0, 50)
+      : [];
+    const rightHeaders: string[] = Array.isArray(req.body?.rightHeaders)
+      ? req.body.rightHeaders.map(String).slice(0, 50)
+      : [];
+
+    if (leftHeaders.length === 0 || rightHeaders.length === 0) {
+      res.status(400).json({ error: '缺少左右两表的表头列表' });
+      return;
+    }
+
+    const fallback = suggestReconcileMapping(leftHeaders, rightHeaders);
+    const llm = runtimeConfig.getEffective();
+    if (!llm.apiKey) {
+      res.json({ ok: true, mode: 'heuristic', mapping: fallback });
+      return;
+    }
+
+    const baseUrl = await assertPublicHttpsBaseUrl(llm.baseUrl);
+    const response = await fetch(`${baseUrl}/chat/completions`, {
+      method: 'POST',
+      signal: AbortSignal.timeout(30000),
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${llm.apiKey}`,
+      },
+      body: JSON.stringify({
+        model: llm.freeModel,
+        temperature: 0.1,
+        messages: [
+          {
+            role: 'system',
+            content:
+              '你是表格对账列名对齐专家。给定表A和表B的列名，找出最适合作为对账主键的一对列，以及需要核对差异的列对。仅输出 JSON：{"leftKeyCol":"...","rightKeyCol":"...","comparePairs":[{"leftCol":"...","rightCol":"..."}]}，列名必须严格来自输入列表。',
+          },
+          {
+            role: 'user',
+            content: `表A列名：${JSON.stringify(leftHeaders)}\n表B列名：${JSON.stringify(rightHeaders)}`,
+          },
+        ],
+      }),
+    });
+
+    if (!response.ok) {
+      res.json({ ok: true, mode: 'heuristic', mapping: fallback });
+      return;
+    }
+
+    const data = (await response.json()) as {
+      choices?: Array<{ message?: { content?: string } }>;
+    };
+    const raw = data.choices?.[0]?.message?.content;
+    if (!raw) {
+      res.json({ ok: true, mode: 'heuristic', mapping: fallback });
+      return;
+    }
+
+    const parsed = parseFirstJsonObject<{
+      leftKeyCol?: string;
+      rightKeyCol?: string;
+      comparePairs?: Array<{ leftCol: string; rightCol: string }>;
+    }>(raw);
+    if (!parsed) {
+      res.json({ ok: true, mode: 'heuristic', mapping: fallback });
+      return;
+    }
+
+    const leftSet = new Set(leftHeaders);
+    const rightSet = new Set(rightHeaders);
+    const leftKeyCol = parsed.leftKeyCol && leftSet.has(parsed.leftKeyCol) ? parsed.leftKeyCol : fallback.leftKeyCol;
+    const rightKeyCol = parsed.rightKeyCol && rightSet.has(parsed.rightKeyCol) ? parsed.rightKeyCol : fallback.rightKeyCol;
+    const comparePairs = Array.isArray(parsed.comparePairs)
+      ? parsed.comparePairs.filter(
+          (p) =>
+            p &&
+            leftSet.has(p.leftCol) &&
+            rightSet.has(p.rightCol) &&
+            (p.leftCol !== leftKeyCol || p.rightCol !== rightKeyCol)
+        )
+      : fallback.comparePairs;
+
+    res.json({
+      ok: true,
+      mode: 'llm',
+      mapping: { leftKeyCol, rightKeyCol, comparePairs },
+    });
+  } catch {
+    const leftHeaders: string[] = Array.isArray(req.body?.leftHeaders) ? req.body.leftHeaders.map(String) : [];
+    const rightHeaders: string[] = Array.isArray(req.body?.rightHeaders) ? req.body.rightHeaders.map(String) : [];
+    res.json({
+      ok: true,
+      mode: 'heuristic',
+      mapping: suggestReconcileMapping(leftHeaders, rightHeaders),
+    });
   }
 });
 

@@ -16,6 +16,11 @@ import {
   prepareFilesForExtraction,
   resolveAttachmentToFile,
 } from './utils/pdfToImages';
+import CleanTab from './components/CleanTab';
+import ReconcileTab from './components/ReconcileTab';
+import DocGenTab from './components/DocGenTab';
+
+type MainTab = 'extract' | 'clean' | 'reconcile' | 'docgen';
 
 const FIELD_TYPE_LABEL: Record<string, string> = {
   text: '文本',
@@ -137,6 +142,7 @@ async function safeParseJson(res: Response): Promise<Record<string, unknown>> {
 }
 
 export default function App() {
+  const [mainTab, setMainTab] = useState<MainTab>('extract');
   const [adapter, setAdapter] = useState<HostAdapter | null>(null);
   const [identity, setIdentity] = useState<UserIdentity | null>(null);
   const [isMock, setIsMock] = useState(false);
@@ -737,6 +743,34 @@ export default function App() {
         </section>
       )}
 
+      {/* 4-Feature Primary Navigation Bar */}
+      <nav className="main-nav" aria-label="核心功能切换">
+        <button
+          className={`main-nav-btn ${mainTab === 'extract' ? 'main-nav-active' : ''}`}
+          onClick={() => setMainTab('extract')}
+        >
+          万物入表
+        </button>
+        <button
+          className={`main-nav-btn ${mainTab === 'clean' ? 'main-nav-active' : ''}`}
+          onClick={() => setMainTab('clean')}
+        >
+          脏数据清洗
+        </button>
+        <button
+          className={`main-nav-btn ${mainTab === 'reconcile' ? 'main-nav-active' : ''}`}
+          onClick={() => setMainTab('reconcile')}
+        >
+          双表对账
+        </button>
+        <button
+          className={`main-nav-btn ${mainTab === 'docgen' ? 'main-nav-active' : ''}`}
+          onClick={() => setMainTab('docgen')}
+        >
+          批量出文档
+        </button>
+      </nav>
+
       {/* Step 1: Target Table Schema */}
       <section className="card">
         <div className="card-header">
@@ -788,6 +822,22 @@ export default function App() {
         )}
       </section>
 
+      {/* Step 2 & 3 for Extract Tab, or modular Feature Tabs */}
+      {mainTab === 'clean' && (
+        <CleanTab
+          adapter={adapter}
+          schema={schema}
+          identity={identity}
+          onQuotaUpdate={setQuota}
+        />
+      )}
+
+      {mainTab === 'reconcile' && <ReconcileTab adapter={adapter} schema={schema} />}
+
+      {mainTab === 'docgen' && <DocGenTab adapter={adapter} schema={schema} />}
+
+      {mainTab === 'extract' && (
+        <>
       {/* Step 2: Input Source */}
       <section className="card">
         <div className="card-header">
@@ -1106,6 +1156,8 @@ export default function App() {
                     : `写入「${schema?.tableName ?? '当前表'}」（${rows.length} 条）`}
           </button>
         </section>
+      )}
+        </>
       )}
     </div>
   );
